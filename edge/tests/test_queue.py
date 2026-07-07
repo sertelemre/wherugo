@@ -19,7 +19,8 @@ def s(tid, sec, x, y, **kw):
 
 
 def put_in_queue(eng, tid, sec0, x=1.0):
-    for i in range(2):  # histerezis: 2 örnek
+    # histerezis (2 örnek) + üyelik teyidi (dwell eşiği 5 sn) için 7 örnek
+    for i in range(7):
         eng.process(s(tid, sec0 + i, x + tid * 0.1, 1.0))
 
 
@@ -64,6 +65,12 @@ def test_served_vs_abandon():
     # track 2 kuyruğu terk eder (abandon): mağaza içine geri döner
     eng.process(s(2, 12, 1.2, -1.0))
     eng.process(s(2, 13, 1.2, -2.0))
+
+    # track 3 kuyruktan yalnızca geçer (pass-through): join/abandon sayılmaz
+    eng.process(s(3, 14, 3.0, 1.0))
+    eng.process(s(3, 15, 3.5, 1.0))
+    eng.process(s(3, 16, 3.5, -1.0))
+    eng.process(s(3, 17, 3.5, -2.0))
 
     m = measurements(eng.tick(T0 + timedelta(seconds=30)))[0]
     assert m.queue_len == 0

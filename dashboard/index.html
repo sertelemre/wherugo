@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>WherUGo — Mağaza Analitiği</title>
+  <link rel="stylesheet" href="./style.css">
+  <!-- ECharts CDN'den yüklenir; yüklenemezse app.js her grafik için HTML tablo
+       fallback'ine düşer (window.echarts kontrolü). Klasik script, module'den
+       önce çalışır — yarış durumu yoktur. -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="brand">Wher<span class="brand-accent">U</span>Go</span>
+      <span class="topbar-div" aria-hidden="true"></span>
+      <span id="store-name" class="store-name">Mağaza yükleniyor…</span>
+    </div>
+    <div class="topbar-right">
+      <div class="seg" role="group" aria-label="Tarih aralığı">
+        <button type="button" class="seg-btn is-active" data-range="today">Bugün</button>
+        <button type="button" class="seg-btn" data-range="yesterday">Dün</button>
+        <button type="button" class="seg-btn" data-range="last7">Son 7 Gün</button>
+      </div>
+      <span class="kvkk-badge"
+        title="Görüntü işleme mağaza içindeki uç cihazda yapılır; buluta yalnız anonim sayısal olaylar gider. Agregat görünümlerde k<10 bastırma uygulanır.">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="4" y="11" width="16" height="10" rx="2"></rect>
+          <path d="M8 11V7a4 4 0 0 1 8 0v4"></path>
+        </svg>
+        Video buluta gitmez · KVKK-native
+      </span>
+    </div>
+  </header>
+
+  <div id="conn-banner" class="conn-banner" role="status" hidden></div>
+
+  <nav class="tabs" role="tablist" aria-label="Görünümler">
+    <button type="button" class="tab-btn is-active" role="tab" aria-selected="true" data-tab="overview">Genel Bakış</button>
+    <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="heatmap">Isı Haritası</button>
+    <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="zones">Bölgeler</button>
+    <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="queue">Kuyruk</button>
+    <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="briefing">Brifing</button>
+  </nav>
+
+  <main id="view" class="view"></main>
+
+  <div id="viz-tip" class="viz-tip" hidden></div>
+
+  <noscript>
+    <p style="padding:20px;text-align:center;color:#52514e">
+      Bu panel JavaScript gerektirir. Lütfen JavaScript'i etkinleştirin.
+    </p>
+  </noscript>
+</body>
+</html>

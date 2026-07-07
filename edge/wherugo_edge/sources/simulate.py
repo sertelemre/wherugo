@@ -72,6 +72,7 @@ class _Agent:
     service_point: Optional[Point] = None
     checkout_idx: Optional[int] = None
     pending_service: Optional[float] = None  # servis süresi (sn)
+    spawned_at: Optional[datetime] = None
     done: bool = False
 
 
@@ -179,11 +180,14 @@ class Simulator:
         rng = self.rng
         tid = self._next_track
         self._next_track += 1
+        staff_now = sum(1 for a in self.agents if a.is_staff)
+        is_staff = rng.random() < self.sim.staff_ratio and staff_now < self.sim.staff_max_concurrent
         agent = _Agent(
             track_id=tid,
-            is_staff=rng.random() < self.sim.staff_ratio,
+            is_staff=is_staff,
             pos=random_point_in(rng, self.entrance.polygon),
             speed=rng.uniform(*self.sim.walk_speed_mps),
+            spawned_at=self.now,
         )
         if not agent.is_staff:
             agent.steps = self._customer_plan(rng)
@@ -201,7 +205,7 @@ class Simulator:
                 if rng.random() < self.sim.pass_by_probability:
                     dwell = rng.uniform(0.5, 3.5)
                 else:
-                    dwell = min(180.0, rng.lognormvariate(math.log(22.0), 0.6))
+                    dwell = min(240.0, rng.lognormvariate(math.log(30.0), 0.65))
                     any_dwell = True
                 steps.append(_Step(point=random_point_in(rng, zone.polygon), zone=zone, dwell_sec=dwell))
         if self.fitting is not None and any_dwell and rng.random() < self.sim.fitting_room_probability:
@@ -235,11 +239,20 @@ class Simulator:
 
     def _begin_next_step(self, agent: _Agent) -> None:
         if not agent.steps:
-            if agent.is_staff:
-                agent.steps.append(self._staff_step())
-            else:
+            if not agent.is_staff:
                 agent.done = True
                 return
+            on_shift = (self.now - agent.spawned_at).total_seconds() < self.sim.staff_shift_sec
+            if on_shift:
+                agent.steps.append(self._staff_step())
+            else:  # vardiya bitti: personel de çıkar
+                agent.steps.append(
+                    _Step(
+                        point=random_point_in(self.rng, self.entrance.polygon),
+                        zone=self.entrance,
+                        kind="exit",
+                    )
+                )
         agent.current = agent.steps.pop(0)
         agent.target = agent.current.point
         agent.state = "walk"
@@ -257,7 +270,9 @@ class Simulator:
             if occupant is None and self.queue:
                 agent = self.queue.pop(0)
                 agent.checkout_idx = i
-                agent.pending_service = min(240.0, self.rng.lognormvariate(math.log(40.0), 0.4))
+                agent.pending_service = min(
+                    300.0, self.rng.lognormvariate(math.log(self.sim.service_time_sec), 0.35)
+                )
                 agent.service_point = self._checkout_points[i]
                 agent.target = agent.service_point
                 agent.state = "walk"

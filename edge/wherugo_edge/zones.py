@@ -84,7 +84,8 @@ class _TrackState:
 
 @dataclass
 class _QueueState:
-    members: set[int] = field(default_factory=set)
+    members: set[int] = field(default_factory=set)      # teyitli kuyruk üyeleri
+    provisional: set[int] = field(default_factory=set)  # dwell eşiğini beklyenler
     joins: int = 0
     abandons: int = 0
     next_due: Optional[datetime] = None
@@ -133,9 +134,12 @@ class ZoneEngine:
         return any(point_in_polygon(x, y, z.polygon) for z in self.checkout_zones)
 
     def _active_checkouts(self) -> int:
+        """Serviste görünen (personel olmayan) track sayısı ~ meşgul kasa sayısı."""
         active = 0
-        for zone in self.checkout_zones:
-            for ts in self._tracks.values():
+        for ts in self._tracks.values():
+            if ts.last is not None and ts.last.is_staff:
+                continue
+            for zone in self.checkout_zones:
                 zs = ts.zones.get(zone.id)
                 if zs is not None and zs.inside:
                     active += 1
@@ -168,6 +172,7 @@ class ZoneEngine:
                     ev = self._maybe_interaction(zone, zs, sample)
                     if ev is not None:
                         events.append(ev)
+                    self._maybe_confirm_queue_join(zone, zs, sample)
                 else:
                     zs.streak_out += 1
                     if zs.streak_out == 1:
@@ -185,9 +190,8 @@ class ZoneEngine:
         zs.enter_ts = zs.pending_enter_ts or sample.ts
         zs.interaction_done = False
         if zone.zone_type == "queue" and not sample.is_staff:
-            q = self._queues[zone.id]
-            q.members.add(sample.track_id)
-            q.joins += 1
+            # üyelik dwell eşiğinde teyit edilir; geçip gidenler join sayılmaz
+            self._queues[zone.id].provisional.add(sample.track_id)
         return ZoneEnter(
             event_time=zs.enter_ts,
             zone_id=zone.id,
@@ -200,6 +204,16 @@ class ZoneEngine:
                 coverage_ok=True,
             ),
         )
+
+    def _maybe_confirm_queue_join(self, zone: ZoneDef, zs: _ZoneState, sample: TrackSample) -> None:
+        if zone.zone_type != "queue" or sample.is_staff:
+            return
+        q = self._queues[zone.id]
+        if sample.track_id in q.provisional:
+            if (sample.ts - zs.enter_ts).total_seconds() >= self.dwell_threshold_sec:
+                q.provisional.discard(sample.track_id)
+                q.members.add(sample.track_id)
+                q.joins += 1
 
     def _maybe_interaction(
         self, zone: ZoneDef, zs: _ZoneState, sample: TrackSample
@@ -240,6 +254,8 @@ class ZoneEngine:
                 )
                 if not served:
                     q.abandons += 1
+            else:
+                q.provisional.discard(track_id)  # geçip gitti: join/abandon yok
         zs.inside = False
         zs.streak_in = 0
         zs.streak_out = 0

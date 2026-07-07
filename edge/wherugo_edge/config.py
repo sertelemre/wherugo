@@ -57,6 +57,8 @@ class EngineParams:
 @dataclass
 class SimParams:
     staff_ratio: float = 0.1
+    staff_max_concurrent: int = 2
+    staff_shift_sec: float = 2400.0
     arrivals_per_hour: float = 120.0
     hourly_curve: list[float] = field(default_factory=lambda: list(DEFAULT_HOURLY_CURVE))
     walk_speed_mps: tuple[float, float] = (0.9, 1.5)
@@ -64,6 +66,7 @@ class SimParams:
     fitting_room_probability: float = 0.25
     pass_by_probability: float = 0.30
     checkout_count: int = 2
+    service_time_sec: float = 75.0  # kasada kişi başı servis (lognormal medyanı)
 
 
 @dataclass
@@ -164,6 +167,16 @@ def _parse_sim(raw: dict) -> SimParams:
         sp.checkout_count = int(raw["checkout_count"])
         if sp.checkout_count < 1:
             raise ConfigError("simulation.checkout_count >= 1 olmalı")
+    for key in ("staff_shift_sec", "service_time_sec"):
+        if key in raw:
+            val = float(raw[key])
+            if val <= 0:
+                raise ConfigError(f"simulation.{key} pozitif olmalı")
+            setattr(sp, key, val)
+    if "staff_max_concurrent" in raw:
+        sp.staff_max_concurrent = int(raw["staff_max_concurrent"])
+        if sp.staff_max_concurrent < 0:
+            raise ConfigError("simulation.staff_max_concurrent negatif olamaz")
     return sp
 
 

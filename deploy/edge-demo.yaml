@@ -65,18 +65,21 @@ zone_engine:
   dwell_threshold_sec: 5.0   # zone_exit.classification: dwell | pass_by
   interaction_dwell_sec: 8.0 # shelf'te interaction_candidate eşiği
   queue_interval_sec: 30     # queue_measurement periyodu
-  service_time_sec: 45       # est_wait_sec tahmini için kişi başı servis süresi
+  service_time_sec: 60       # est_wait_sec tahmini için kişi başı servis süresi
 
 simulation:
   staff_ratio: 0.1
+  staff_max_concurrent: 2    # aynı anda mağazadaki personel tavanı
+  staff_shift_sec: 2400      # personel vardiya süresi (sim sn)
   arrivals_per_hour: 120
   hourly_curve: [0.30, 0.30, 0.30, 0.30, 0.30, 0.35, 0.40, 0.50, 0.60, 0.75, 0.90, 1.00,
                  1.00, 0.95, 0.85, 0.80, 0.85, 0.95, 1.00, 0.90, 0.70, 0.55, 0.45, 0.35]
   walk_speed_mps: [0.9, 1.5]
-  buy_probability: 0.35
+  buy_probability: 0.40
   fitting_room_probability: 0.25
   pass_by_probability: 0.30
   checkout_count: 2
+  service_time_sec: 120      # kasada kişi başı servis süresi (lognormal medyanı)
 
 publisher:
   spool_path: "wherugo-edge-spool.sqlite"
