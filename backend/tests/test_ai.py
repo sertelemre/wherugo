@@ -64,10 +64,12 @@ def test_briefing_generated_and_cached(client, monkeypatch):
     assert body["metric_refs"] == ["footfall.total", "funnel.entered"]
     assert len([c for c in calls if c[0] == "generate"]) == 1
 
-    # metrics_bundle passed to ai must contain the contract summary keys
+    # metrics_bundle must follow the schema documented in ai/wherugo_ai/briefing.py
     bundle = calls[0][1]
-    for key in ("store", "window", "footfall", "dwell", "queues", "funnel", "coverage_gaps"):
+    for key in ("store", "window", "footfall_total", "footfall_by_hour",
+                "zones", "funnel", "coverage_gap_min"):
         assert key in bundle
+    assert set(bundle["funnel"]) == {"entered", "engaged", "interacted", "transactions"}
 
     # second call: served from DB, no new generate call
     resp2 = client.get("/v1/stores/1/briefing", headers=AUTH, params={"date": "2026-07-07"})

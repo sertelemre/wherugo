@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -30,6 +31,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--start", default=None, help="sim başlangıç zamanı (RFC3339, vars: şimdi)")
     ap.add_argument("--spool", default=None, help="SQLite spool yolu (vars: config publisher.spool_path)")
     ap.add_argument("--video-source", default=None, help="--source video için RTSP URL / dosya yolu")
+    ap.add_argument(
+        "--backend-url",
+        default=None,
+        help="config'teki backend_url'i geçersiz kıl (vars: env WHERUGO_BACKEND_URL, sonra config)",
+    )
     return ap
 
 
@@ -106,6 +112,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     except ConfigError as exc:
         print(f"config hatası: {exc}", file=sys.stderr)
         return 2
+
+    backend_override = args.backend_url or os.environ.get("WHERUGO_BACKEND_URL")
+    if backend_override:
+        cfg.backend_url = backend_override.rstrip("/")
 
     if args.source == "video":
         return _run_video(cfg, args)

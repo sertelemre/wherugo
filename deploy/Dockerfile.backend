@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY ai/ ./ai/
+COPY backend/ ./backend/
+COPY dashboard/ ./dashboard/
+RUN pip install --no-cache-dir -e ./ai -e ./backend
+
+EXPOSE 8000
+ENV WHERUGO_DB_URL=sqlite:////data/wherugo.db
+VOLUME ["/data"]
+CMD ["uvicorn", "wherugo_backend.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

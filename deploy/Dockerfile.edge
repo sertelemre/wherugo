@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY edge/ ./edge/
+COPY deploy/edge-demo.yaml ./deploy/edge-demo.yaml
+RUN pip install --no-cache-dir -e ./edge
+
+# Simülasyon modu varsayılan; gerçek sahada [cv] extra + --source video kullanılır.
+CMD ["wherugo-edge", "--config", "deploy/edge-demo.yaml", "--source", "simulate", \
+     "--speed", "20", "--duration", "43200", "--seed", "42"]

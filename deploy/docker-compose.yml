@@ -1,0 +1,40 @@
+# WherUGo demo: backend (dashboard dahil) + sentetik edge simülatörü
+# Çalıştırma: docker compose -f deploy/docker-compose.yml up --build
+# Dashboard:  http://localhost:8000
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - wherugo-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/v1/stores', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    environment:
+      # AI sağlayıcısı: mock (anahtarsız) | openai (MiMo/vLLM: WHERUGO_LLM_BASE_URL) | anthropic
+      WHERUGO_LLM_PROVIDER: ${WHERUGO_LLM_PROVIDER:-mock}
+      WHERUGO_LLM_BASE_URL: ${WHERUGO_LLM_BASE_URL:-}
+      WHERUGO_LLM_MODEL: ${WHERUGO_LLM_MODEL:-}
+      WHERUGO_LLM_API_KEY: ${WHERUGO_LLM_API_KEY:-}
+
+  edge-simulator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.edge
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      WHERUGO_BACKEND_URL: http://backend:8000
+    command: >
+      wherugo-edge --config deploy/edge-demo.yaml --source simulate
+      --speed 20 --duration 43200 --seed 42
+      --backend-url http://backend:8000
+
+volumes:
+  wherugo-data:

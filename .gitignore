@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv*/
+venv*/
+*.db
+*.sqlite
+wherugo-edge-spool.sqlite*
+.env
+node_modules/
+dist/
+build/

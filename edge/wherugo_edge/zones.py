@@ -162,7 +162,10 @@ class ZoneEngine:
                     if zs.streak_in == 1:
                         zs.pending_enter_ts = sample.ts
                         zs.pending_enter_pos = (sample.x_m, sample.y_m)
-                    if zs.streak_in >= self.hysteresis:
+                    # Giris bolgesi dar ve gecis hizli: tek ornek yeterli sayilir,
+                    # yoksa 1 Hz'de hizli yuruyen musteri footfall'dan duser.
+                    needed = 1 if zone.zone_type == "entrance" else self.hysteresis
+                    if zs.streak_in >= needed:
                         events.append(self._confirm_enter(zone, zs, sample))
                 else:
                     zs.streak_in = 0

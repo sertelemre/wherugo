@@ -63,6 +63,18 @@ def _entrance_zone_ids(session: Session, store_id: int) -> list[int]:
         select(Zone.id).where(Zone.store_id == store_id, Zone.zone_type == "entrance")))
 
 
+def _all_zone_visitors(session: Session, store_id: int, t_from: datetime, t_to: datetime) -> set[int]:
+    """Unique non-staff track_ids with any zone_visit in window."""
+    rows = session.scalars(
+        select(ZoneVisit.track_id)
+        .where(ZoneVisit.store_id == store_id,
+               ZoneVisit.is_staff == False,  # noqa: E712
+               ZoneVisit.enter_ts >= t_from,
+               ZoneVisit.enter_ts <= t_to)
+    ).all()
+    return set(rows)
+
+
 def _entrance_visitors(session: Session, store_id: int, t_from: datetime, t_to: datetime) -> set[int]:
     """Unique non-staff track_ids with an entrance zone_visit in window."""
     zids = _entrance_zone_ids(session, store_id)
@@ -170,8 +182,10 @@ def dwell_stats(session: Session, store_id: int, zone_id: int,
         elif s in ("avg", "mean"):
             out_stats[s] = (sum(dwell_values) / len(dwell_values)) if dwell_values else None
     zone_visitors = {v.track_id for v in visits}
-    store_visitors = _entrance_visitors(session, store_id, t_from, t_to)
-    draw_rate = round(len(zone_visitors) / len(store_visitors), 4) if store_visitors else None
+    store_visitors = _entrance_visitors(session, store_id, t_from, t_to) | _all_zone_visitors(
+        session, store_id, t_from, t_to)
+    draw_rate = (round(min(1.0, len(zone_visitors) / len(store_visitors)), 4)
+                 if store_visitors else None)
     return {"stats": out_stats, "visits": len(visits), "draw_rate": draw_rate,
             "has_data": bool(visits)}
 
@@ -305,7 +319,7 @@ def queue_live(session: Session, store_id: int, zone_id: int, now: datetime) -> 
 
 def funnel(session: Session, store_id: int, t_from: datetime, t_to: datetime) -> dict[str, Any]:
     """entered -> visited a zone -> interacted -> purchased (pos_daily)."""
-    entered = _entrance_visitors(session, store_id, t_from, t_to)
+    entrance_visitors = _entrance_visitors(session, store_id, t_from, t_to)
     entrance_ids = set(_entrance_zone_ids(session, store_id))
     visited_rows = session.execute(
         select(ZoneVisit.track_id, ZoneVisit.zone_id)
@@ -323,6 +337,10 @@ def funnel(session: Session, store_id: int, t_from: datetime, t_to: datetime) ->
                EventRaw.event_time <= t_to)
     ).all()
     interacted = {p[0].get("track_id") for p in interactions if p[0] and p[0].get("track_id") is not None}
+    # Monotonluk: zone ziyareti olan herkes magazaya girmistir (giris kamerasi
+    # kacirsa bile); etkilesim de ancak bir zone ziyareti icinde olur.
+    entered = entrance_visitors | visited
+    interacted &= visited
     purchased = session.execute(
         select(PosDaily.transactions)
         .where(PosDaily.store_id == store_id,
@@ -330,7 +348,7 @@ def funnel(session: Session, store_id: int, t_from: datetime, t_to: datetime) ->
                PosDaily.date <= t_to.date())
     ).all()
     tx_total = sum(r[0] for r in purchased)
-    has_data = bool(entered or visited_rows or interactions or purchased)
+    has_data = bool(entrance_visitors or visited_rows or interactions or purchased)
     return {
         "steps": [
             {"name": "entered", "value": float(len(entered))},

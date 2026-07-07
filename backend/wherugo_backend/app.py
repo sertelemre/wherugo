@@ -8,7 +8,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -21,26 +21,27 @@ from .models import Camera, EdgeDevice, Store, Tenant, Zone
 DEMO_STORE_ID = 1
 DEMO_DEVICE_ID = "edge-1a"
 
-# Zones for the 20x12 m demo fashion store (CONTRACTS section 6:
-# entrance, 4 shelves, fitting room, queue, checkout). Fixed ids 1..8 so the
-# edge simulator config (deploy/edge-demo.yaml) can reference them stably.
+# Zones for the 20x12 m demo fashion store (CONTRACTS section 6: entrance,
+# 4 shelves, fitting room, queue, checkout). Names and polygons MUST mirror
+# deploy/edge-demo.yaml: the simulator generates traffic against its own
+# polygons and the dashboard overlays the polygons stored here.
 DEMO_ZONES: list[dict] = [
-    {"id": 1, "name": "entrance", "zone_type": "entrance", "category": None,
+    {"id": 1, "name": "Giriş", "zone_type": "entrance", "category": None,
      "polygon": [[8, 0], [12, 0], [12, 2], [8, 2]]},
-    {"id": 2, "name": "shelf_women", "zone_type": "shelf", "category": "women",
-     "polygon": [[1, 3], [6, 3], [6, 6], [1, 6]]},
-    {"id": 3, "name": "shelf_men", "zone_type": "shelf", "category": "men",
-     "polygon": [[1, 7], [6, 7], [6, 10], [1, 10]]},
-    {"id": 4, "name": "shelf_accessories", "zone_type": "shelf", "category": "accessories",
-     "polygon": [[8, 4], [13, 4], [13, 7], [8, 7]]},
-    {"id": 5, "name": "shelf_shoes", "zone_type": "shelf", "category": "shoes",
-     "polygon": [[14, 3], [19, 3], [19, 6], [14, 6]]},
-    {"id": 6, "name": "fitting_room", "zone_type": "fitting_room", "category": None,
-     "polygon": [[14, 8], [19, 8], [19, 11], [14, 11]]},
-    {"id": 7, "name": "queue", "zone_type": "queue", "category": None,
-     "polygon": [[6, 9], [9, 9], [9, 11], [6, 11]]},
-    {"id": 8, "name": "checkout", "zone_type": "checkout", "category": None,
-     "polygon": [[2, 9], [5, 9], [5, 11], [2, 11]]},
+    {"id": 2, "name": "Kadın Üst Giyim", "zone_type": "shelf", "category": "kadin",
+     "polygon": [[1, 3], [6, 3], [6, 7], [1, 7]]},
+    {"id": 3, "name": "Erkek Üst Giyim", "zone_type": "shelf", "category": "erkek",
+     "polygon": [[14, 3], [19, 3], [19, 7], [14, 7]]},
+    {"id": 4, "name": "Aksesuar", "zone_type": "shelf", "category": "aksesuar",
+     "polygon": [[7.5, 3.5], [12.5, 3.5], [12.5, 8], [7.5, 8]]},
+    {"id": 5, "name": "Ayakkabı", "zone_type": "shelf", "category": "ayakkabi",
+     "polygon": [[1, 8], [6, 8], [6, 11.5], [1, 11.5]]},
+    {"id": 6, "name": "Deneme Kabini Önü", "zone_type": "fitting_room", "category": None,
+     "polygon": [[14, 8], [17, 8], [17, 11.5], [14, 11.5]]},
+    {"id": 7, "name": "Kasa Kuyruğu", "zone_type": "queue", "category": None,
+     "polygon": [[7, 9], [12, 9], [12, 10.5], [7, 10.5]]},
+    {"id": 8, "name": "Kasa", "zone_type": "checkout", "category": None,
+     "polygon": [[7, 10.5], [12, 10.5], [12, 12], [7, 12]]},
 ]
 
 
@@ -98,26 +99,26 @@ def create_app(db_url: str | None = None) -> FastAPI:
 
     app.include_router(router)
 
-    dashboard = _dashboard_dir()
-    if dashboard.is_dir():
-        app.mount("/static", StaticFiles(directory=str(dashboard)), name="static")
-
-    @app.get("/", include_in_schema=False)
-    def root():
-        index = dashboard / "index.html"
-        if index.is_file():
-            return FileResponse(str(index))
-        return JSONResponse({
-            "service": "wherugo-backend",
-            "version": __version__,
-            "docs": "/docs",
-            "api_base": "/v1",
-            "note": "dashboard/index.html not found; API-only mode",
-        })
-
     @app.get("/healthz", include_in_schema=False)
     def healthz():
         return {"status": "ok"}
+
+    dashboard = _dashboard_dir()
+    if dashboard.is_dir() and (dashboard / "index.html").is_file():
+        # Kök mount EN SON eklenir: /v1 ve /healthz önce eşleşir; index.html
+        # varlıkları göreli yoldan (/app.js, /style.css) istediği için kökten
+        # servis edilmek zorundadır (/static altına koymak onları 404 yapar).
+        app.mount("/", StaticFiles(directory=str(dashboard), html=True), name="dashboard")
+    else:
+        @app.get("/", include_in_schema=False)
+        def root():
+            return JSONResponse({
+                "service": "wherugo-backend",
+                "version": __version__,
+                "docs": "/docs",
+                "api_base": "/v1",
+                "note": "dashboard/index.html not found; API-only mode",
+            })
 
     return app
 
