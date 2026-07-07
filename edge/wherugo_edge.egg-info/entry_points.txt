@@ -1,0 +1,2 @@
+[console_scripts]
+wherugo-edge = wherugo_edge.main:main

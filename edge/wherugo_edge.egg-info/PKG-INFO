@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: wherugo-edge
+Version: 0.1.0
+Summary: WherUGo kenar ajanı: kaynak -> takip -> homografi -> zone motoru -> publisher (CONTRACTS §6)
+Requires-Python: >=3.10
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: requests>=2.28
+Provides-Extra: cv
+Requires-Dist: ultralytics; extra == "cv"
+Requires-Dist: opencv-python; extra == "cv"
+Provides-Extra: test
+Requires-Dist: pytest>=7.0; extra == "test"
