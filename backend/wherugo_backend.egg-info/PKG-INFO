@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: wherugo-backend
+Version: 0.1.0
+Summary: WherUGo backend: ingest + analytics + API + dashboard serving (CONTRACTS.md section 3-4)
+Requires-Python: >=3.10
+Requires-Dist: fastapi
+Requires-Dist: uvicorn[standard]
+Requires-Dist: sqlalchemy>=2
+Requires-Dist: pydantic>=2
+Requires-Dist: python-multipart
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+Requires-Dist: httpx; extra == "test"

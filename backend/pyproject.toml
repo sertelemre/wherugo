@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wherugo-backend"
+version = "0.1.0"
+description = "WherUGo backend: ingest + analytics + API + dashboard serving (CONTRACTS.md section 3-4)"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy>=2",
+    "pydantic>=2",
+    "python-multipart",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "httpx"]
+
+[tool.setuptools.packages.find]
+include = ["wherugo_backend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

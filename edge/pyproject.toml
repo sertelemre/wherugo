@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wherugo-edge"
+version = "0.1.0"
+description = "WherUGo kenar ajanı: kaynak -> takip -> homografi -> zone motoru -> publisher (CONTRACTS §6)"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml>=6.0",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+cv = ["ultralytics", "opencv-python"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+wherugo-edge = "wherugo_edge.main:main"
+
+[tool.setuptools.packages.find]
+include = ["wherugo_edge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
