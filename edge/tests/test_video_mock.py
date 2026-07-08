@@ -129,9 +129,13 @@ def test_tracker_separates_distant_objects():
     m0 = tr.update([box(50, 120), box(300, 120)])
     assert len({tid for tid, _ in m0}) == 2
     m1 = tr.update([box(58, 120), box(292, 120)])
-    by_pos = {round(d.centroid[0] / 100): tid for tid, d in m1}
-    by_pos0 = {round(d.centroid[0] / 100): tid for tid, d in m0}
-    assert by_pos == by_pos0  # id'ler çaprazlanmadı
+
+    def sides(matched):
+        left = next(tid for tid, d in matched if d.centroid[0] < 150)
+        right = next(tid for tid, d in matched if d.centroid[0] >= 150)
+        return left, right
+
+    assert sides(m1) == sides(m0)  # id'ler çaprazlanmadı
 
 
 # -- uçtan uca: kare -> mock dedektör -> homografi -> zone olayları ----------
