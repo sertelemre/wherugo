@@ -1,7 +1,9 @@
-"""FastAPI app factory: create_all + demo seed on startup, CORS open,
-serves ../dashboard/index.html at / when present."""
+"""FastAPI app factory: column migrations + create_all + demo seed on startup,
+CORS open, serves ../dashboard/index.html at / when present. v2: daily
+briefing scheduler task (WHERUGO_BRIEFING_AUTO=0 disables)."""
 from __future__ import annotations
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -10,11 +12,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import inspect, text
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from . import __version__
+from . import scheduler, __version__
 from .api import router
-from .auth import DEMO_TENANT_ID
+from .auth import DEMO_TENANT_ID, demo_api_key, hash_api_key
 from .db import Base, create_db_engine, create_session_factory
 from .models import Camera, EdgeDevice, Store, Tenant, Zone
 
@@ -45,11 +49,43 @@ DEMO_ZONES: list[dict] = [
 ]
 
 
+# v2 columns that create_all will NOT add to a pre-existing table (SQLAlchemy
+# create_all only creates missing TABLES). Forward-only, additive migrations;
+# the plain "ALTER TABLE ... ADD COLUMN" syntax works on both SQLite and PG.
+V2_COLUMNS: list[tuple[str, str, str]] = [
+    ("tenant", "api_key_hash", "VARCHAR(64)"),
+    ("store", "webhook_url", "VARCHAR(500)"),
+]
+
+
+def run_column_migrations(engine: Engine) -> None:
+    """Add missing v2 columns to already-existing tables (no-op on fresh DBs:
+    create_all creates those tables with the columns already in place)."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    for table, column, ddl_type in V2_COLUMNS:
+        if table not in tables:
+            continue  # create_all will create it with the column included
+        existing = {c["name"] for c in inspector.get_columns(table)}
+        if column in existing:
+            continue
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+
+
 def seed_demo(session: Session) -> None:
-    """Idempotent demo seed: tenant t_demo + store 1 'Demo Mağaza' (20x12 m) + zones."""
-    if session.get(Tenant, DEMO_TENANT_ID) is not None:
+    """Idempotent demo seed: tenant t_demo + store 1 'Demo Mağaza' (20x12 m) + zones.
+    Also (re)fills t_demo.api_key_hash from WHERUGO_DEMO_API_KEY so a DB
+    migrated from v1 can immediately use POST /v1/auth/token."""
+    demo_hash = hash_api_key(demo_api_key())
+    existing = session.get(Tenant, DEMO_TENANT_ID)
+    if existing is not None:
+        if not existing.api_key_hash:  # v1 database migrated in place
+            existing.api_key_hash = demo_hash
+            session.commit()
         return
-    session.add(Tenant(id=DEMO_TENANT_ID, name="Demo Tenant", isolation_tier="shared"))
+    session.add(Tenant(id=DEMO_TENANT_ID, name="Demo Tenant", isolation_tier="shared",
+                       api_key_hash=demo_hash))
     session.add(Store(id=DEMO_STORE_ID, tenant_id=DEMO_TENANT_ID, name="Demo Mağaza",
                       plan_width_m=20.0, plan_height_m=12.0, timezone="Europe/Istanbul"))
     session.add(EdgeDevice(id=DEMO_DEVICE_ID, store_id=DEMO_STORE_ID, name="Demo Edge",
@@ -79,10 +115,22 @@ def create_app(db_url: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        run_column_migrations(engine)
         Base.metadata.create_all(engine)
         with session_factory() as session:
             seed_demo(session)
+        # v2 (CONTRACTS section 14): daily briefing scheduler. Disabled with
+        # WHERUGO_BRIEFING_AUTO=0 (tests set this so no background task lingers).
+        briefing_task: asyncio.Task | None = None
+        if scheduler.briefing_auto_enabled():
+            briefing_task = asyncio.create_task(scheduler.briefing_loop(session_factory))
         yield
+        if briefing_task is not None:
+            briefing_task.cancel()
+            try:
+                await briefing_task
+            except asyncio.CancelledError:
+                pass
         engine.dispose()
 
     app = FastAPI(title="WherUGo Backend", version=__version__, lifespan=lifespan)

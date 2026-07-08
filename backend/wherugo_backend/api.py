@@ -6,22 +6,26 @@ import csv
 import io
 from datetime import date as date_type, datetime, timedelta
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import (APIRouter, BackgroundTasks, Depends, File, HTTPException, Query,
+                     Request, Response, UploadFile)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import alerts as alerts_mod
 from . import insights, metrics
-from .auth import AuthContext, get_auth
+from .auth import TOKEN_TTL_SEC, AuthContext, get_auth, hash_api_key, issue_token
 from .ingest import process_batch
-from .models import Briefing, EdgeDevice, PosDaily, Store, Zone
+from .models import Alert, Briefing, EdgeDevice, PosDaily, Store, Tenant, Zone
 from .quality import quality_context
 from .schemas import (
     MAX_BATCH_SIZE,
+    AlertOut,
     AssistantRequest,
     AssistantResponse,
     BriefingResponse,
     CoverageGapsResponse,
+    DeviceCreate,
     DeviceHealthResponse,
     DwellResponse,
     FirstDestinationResponse,
@@ -32,9 +36,15 @@ from .schemas import (
     MetricsResponse,
     PosImportResponse,
     QueueLiveResponse,
+    StoreCreate,
     StoreOut,
+    StoreUpdate,
+    TokenRequest,
+    TokenResponse,
     TransitionsResponse,
+    ZoneCreate,
     ZoneOut,
+    ZoneUpdate,
 )
 from .util import parse_date, parse_window, utcnow
 
@@ -56,25 +66,67 @@ def _get_store(db: Session, auth: AuthContext, store_id: int) -> Store:
     return store
 
 
+def _zone_out(z: Zone) -> ZoneOut:
+    return ZoneOut(id=z.id, store_id=z.store_id, name=z.name, zone_type=z.zone_type,
+                   polygon=z.polygon_json, category=z.category)
+
+
 def _store_out(db: Session, store: Store) -> StoreOut:
     zones = db.scalars(select(Zone).where(Zone.store_id == store.id).order_by(Zone.id)).all()
     return StoreOut(
         id=store.id, tenant_id=store.tenant_id, name=store.name,
         plan_width_m=store.plan_width_m, plan_height_m=store.plan_height_m,
-        timezone=store.timezone,
-        zones=[ZoneOut(id=z.id, store_id=z.store_id, name=z.name, zone_type=z.zone_type,
-                       polygon=z.polygon_json, category=z.category) for z in zones],
+        timezone=store.timezone, webhook_url=store.webhook_url,
+        zones=[_zone_out(z) for z in zones],
     )
+
+
+def _get_zone(db: Session, store_id: int, zone_id: int) -> Zone:
+    zone = db.get(Zone, zone_id)
+    if zone is None or zone.store_id != store_id:
+        raise HTTPException(status_code=404, detail="zone not found")
+    return zone
+
+
+def _device_out(device: EdgeDevice) -> DeviceHealthResponse:
+    hb = device.last_heartbeat
+    online = hb is not None and (utcnow() - hb).total_seconds() < 300
+    return DeviceHealthResponse(id=device.id, store_id=device.store_id, name=device.name,
+                                last_heartbeat=hb.isoformat() + "Z" if hb else None,
+                                online=online, health=device.health_json)
+
+
+# --- auth v2 (CONTRACTS section 9) ----------------------------------------------
+
+@router.post("/auth/token", response_model=TokenResponse)
+def auth_token(body: TokenRequest, db: Session = Depends(get_db)):
+    """Exchange a tenant API key for an HS256 JWT (claims: tenant, exp).
+    The key is matched against tenant.api_key_hash (sha256); a wrong key is 401."""
+    api_key = body.api_key or ""
+    tenant = db.scalars(
+        select(Tenant).where(Tenant.api_key_hash == hash_api_key(api_key)).limit(1)
+    ).first() if api_key else None
+    if tenant is None:
+        raise HTTPException(status_code=401, detail="invalid api key")
+    return TokenResponse(token=issue_token(tenant.id), expires_in=TOKEN_TTL_SEC)
 
 
 # --- ingest -------------------------------------------------------------------
 
 @router.post("/ingest/events", response_model=IngestResponse)
-def ingest_events(body: IngestRequest, db: Session = Depends(get_db),
+def ingest_events(body: IngestRequest, background_tasks: BackgroundTasks,
+                  request: Request, db: Session = Depends(get_db),
                   auth: AuthContext = Depends(get_auth)):
     if len(body.events) > MAX_BATCH_SIZE:
         raise HTTPException(status_code=413, detail=f"batch too large (max {MAX_BATCH_SIZE})")
     result = process_batch(db, auth.tenant_id, body.events)
+    # Alert webhooks (CONTRACTS section 11): delivered in the background after
+    # the batch commit; a failed delivery keeps the alert with delivered=false.
+    for job in result.webhook_jobs:
+        if job.get("url"):
+            background_tasks.add_task(alerts_mod.deliver_webhook,
+                                      request.app.state.sessionmaker,
+                                      job["alert_id"], job["url"], job["payload"])
     return IngestResponse(accepted=result.accepted, duplicates=result.duplicates,
                           gap_detected=result.gap_detected, rejected=result.rejected)
 
@@ -91,6 +143,165 @@ def list_stores(db: Session = Depends(get_db), auth: AuthContext = Depends(get_a
 def get_store(store_id: int, db: Session = Depends(get_db),
               auth: AuthContext = Depends(get_auth)):
     return _store_out(db, _get_store(db, auth, store_id))
+
+
+# --- management API (CONTRACTS section 10) ---------------------------------------
+#
+# NOTE (contract section 10): store/zone changes made here do NOT propagate to
+# the edge automatically in the MVP — the edge reads its zones/homography from
+# its local YAML config. The production path is a signed config push (docs/06
+# section 6.6). Update deploy/edge-demo.yaml (or the device's config) by hand
+# after changing zones, otherwise the edge keeps emitting events for the old
+# geometry.
+
+@router.post("/stores", response_model=StoreOut, status_code=201)
+def create_store(body: StoreCreate, db: Session = Depends(get_db),
+                 auth: AuthContext = Depends(get_auth)):
+    """Create a store for the authenticated tenant (tenant comes from auth,
+    never from the body). NOTE: zones added later are NOT pushed to the edge
+    automatically — the edge reads its own YAML config (see section note above)."""
+    store = Store(tenant_id=auth.tenant_id, name=body.name,
+                  plan_width_m=body.plan_width_m, plan_height_m=body.plan_height_m,
+                  timezone=body.timezone, webhook_url=body.webhook_url)
+    db.add(store)
+    db.commit()
+    return _store_out(db, store)
+
+
+@router.put("/stores/{store_id}", response_model=StoreOut)
+def update_store(store_id: int, body: StoreUpdate, db: Session = Depends(get_db),
+                 auth: AuthContext = Depends(get_auth)):
+    """Partial store update; accepts webhook_url (CONTRACTS section 11). Only
+    fields present in the body are changed (webhook_url: null clears it)."""
+    store = _get_store(db, auth, store_id)
+    data = body.model_dump(exclude_unset=True)
+    for field in ("name", "plan_width_m", "plan_height_m", "timezone", "webhook_url"):
+        if field in data:
+            setattr(store, field, data[field])
+    db.commit()
+    return _store_out(db, store)
+
+
+@router.post("/stores/{store_id}/zones", response_model=ZoneOut, status_code=201)
+def create_zone(store_id: int, body: ZoneCreate, db: Session = Depends(get_db),
+                auth: AuthContext = Depends(get_auth)):
+    """Add a zone (id assigned by the server). NOT auto-pushed to the edge:
+    the edge simulator/tracker keeps using its local YAML zone polygons."""
+    _get_store(db, auth, store_id)
+    zone = Zone(store_id=store_id, name=body.name, zone_type=body.zone_type,
+                polygon_json=body.polygon, category=body.category)
+    db.add(zone)
+    db.commit()
+    return _zone_out(zone)
+
+
+@router.put("/stores/{store_id}/zones/{zone_id}", response_model=ZoneOut)
+def update_zone(store_id: int, zone_id: int, body: ZoneUpdate,
+                db: Session = Depends(get_db), auth: AuthContext = Depends(get_auth)):
+    """Partial zone update. NOT auto-pushed to the edge (local YAML config)."""
+    _get_store(db, auth, store_id)
+    zone = _get_zone(db, store_id, zone_id)
+    data = body.model_dump(exclude_unset=True)
+    if "polygon" in data:
+        zone.polygon_json = data.pop("polygon")
+    for field in ("name", "zone_type", "category"):
+        if field in data:
+            setattr(zone, field, data[field])
+    db.commit()
+    return _zone_out(zone)
+
+
+@router.delete("/stores/{store_id}/zones/{zone_id}", status_code=204)
+def delete_zone(store_id: int, zone_id: int, db: Session = Depends(get_db),
+                auth: AuthContext = Depends(get_auth)):
+    """Delete a zone definition. Historical data (zone_visit, queue_sample,
+    alert rows referencing the zone id) is intentionally KEPT (CONTRACTS
+    section 10); only the zone definition disappears from store detail."""
+    _get_store(db, auth, store_id)
+    zone = _get_zone(db, store_id, zone_id)
+    db.delete(zone)
+    db.commit()
+    return Response(status_code=204)
+
+
+@router.post("/stores/{store_id}/devices", response_model=DeviceHealthResponse,
+             status_code=201)
+def create_device(store_id: int, body: DeviceCreate, db: Session = Depends(get_db),
+                  auth: AuthContext = Depends(get_auth)):
+    """Register an edge device (id chosen by the caller, e.g. 'edge-1a')."""
+    _get_store(db, auth, store_id)
+    if db.get(EdgeDevice, body.id) is not None:
+        raise HTTPException(status_code=409, detail="device already exists")
+    device = EdgeDevice(id=body.id, store_id=store_id, name=body.name or body.id)
+    db.add(device)
+    db.commit()
+    return _device_out(device)
+
+
+@router.get("/stores/{store_id}/devices", response_model=list[DeviceHealthResponse])
+def list_devices(store_id: int, db: Session = Depends(get_db),
+                 auth: AuthContext = Depends(get_auth)):
+    """Device list with health summary (same shape as /v1/admin/devices/{id}/health)."""
+    _get_store(db, auth, store_id)
+    devices = db.scalars(select(EdgeDevice).where(EdgeDevice.store_id == store_id)
+                         .order_by(EdgeDevice.id)).all()
+    return [_device_out(d) for d in devices]
+
+
+# --- alerts (CONTRACTS section 11) -------------------------------------------------
+
+@router.get("/stores/{store_id}/alerts", response_model=list[AlertOut])
+def store_alerts(store_id: int,
+                 from_: str | None = Query(None, alias="from"),
+                 to: str | None = Query(None),
+                 db: Session = Depends(get_db), auth: AuthContext = Depends(get_auth)):
+    _get_store(db, auth, store_id)
+    t_from, t_to = parse_window(from_, to)
+    rows = db.scalars(
+        select(Alert).where(Alert.store_id == store_id,
+                            Alert.ts >= t_from, Alert.ts <= t_to)
+        .order_by(Alert.ts, Alert.id)
+    ).all()
+    out = []
+    for a in rows:
+        payload = a.payload_json or {}
+        out.append(AlertOut(id=a.id, store_id=a.store_id, zone_id=a.zone_id,
+                            type=a.type, ts=a.ts.isoformat() + "Z",
+                            queue_len=payload.get("queue_len"),
+                            est_wait_sec=payload.get("est_wait_sec"),
+                            delivered=a.delivered))
+    return out
+
+
+# --- export (CONTRACTS section 12) ---------------------------------------------------
+
+@router.get("/stores/{store_id}/export/rollup")
+def export_rollup(store_id: int,
+                  from_: str | None = Query(None, alias="from"),
+                  to: str | None = Query(None),
+                  format: str = Query("csv", pattern="^csv$"),
+                  db: Session = Depends(get_db), auth: AuthContext = Depends(get_auth)):
+    """Hourly zone rollup as CSV (attachment). k-anonymity: rows with
+    unique_visitors<10 keep counts but their dwell fields are blank. Raw track
+    data is NEVER exported."""
+    _get_store(db, auth, store_id)
+    t_from, t_to = parse_window(from_, to)
+    rows = metrics.hourly_zone_rollup(db, store_id, t_from, t_to)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["hour", "zone_id", "zone_name", "visits", "unique_visitors",
+                     "dwell_p50", "dwell_p95", "queue_max", "queue_abandons"])
+    for r in rows:
+        writer.writerow([
+            r["hour"], r["zone_id"], r["zone_name"], r["visits"], r["unique_visitors"],
+            "" if r["dwell_p50"] is None else r["dwell_p50"],
+            "" if r["dwell_p95"] is None else r["dwell_p95"],
+            "" if r["queue_max"] is None else r["queue_max"],
+            "" if r["queue_abandons"] is None else r["queue_abandons"],
+        ])
+    filename = f"wherugo-rollup-store{store_id}-{t_from:%Y%m%d%H}-{t_to:%Y%m%d%H}.csv"
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 # --- metrics -------------------------------------------------------------------
@@ -372,8 +583,4 @@ def device_health(device_id: str, db: Session = Depends(get_db),
     store = db.get(Store, device.store_id)
     if store is None or store.tenant_id != auth.tenant_id:
         raise HTTPException(status_code=404, detail="device not found")
-    hb = device.last_heartbeat
-    online = hb is not None and (utcnow() - hb).total_seconds() < 300
-    return DeviceHealthResponse(id=device.id, store_id=device.store_id, name=device.name,
-                                last_heartbeat=hb.isoformat() + "Z" if hb else None,
-                                online=online, health=device.health_json)
+    return _device_out(device)

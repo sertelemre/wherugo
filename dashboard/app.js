@@ -368,6 +368,86 @@ function setBanner(msg) {
   el.textContent = msg;
 }
 
+// --- token/oturum (CONTRACTS §9) --------------------------------------------
+// Varsayılan token 'demo'dur (api.js). Herhangi bir istek 401 dönerse panel
+// açılır; API anahtarı POST /v1/auth/token ile token'a çevrilir ve
+// localStorage'a yazılır. Çıkış, kayıtlı token'ı siler → 'demo'ya dönülür.
+
+function showAuthPanel() {
+  const ov = $('#auth-overlay');
+  if (!ov || !ov.hidden) return; // eşzamanlı 401'lerde tek panel
+  const errEl = $('#auth-err');
+  if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+  ov.hidden = false;
+  const input = $('#auth-key');
+  if (input) { input.value = ''; setTimeout(() => input.focus(), 0); }
+}
+
+function hideAuthPanel() {
+  const ov = $('#auth-overlay');
+  if (ov) ov.hidden = true;
+}
+
+function setAuthPanelError(msg) {
+  const el = $('#auth-err');
+  if (!el) return;
+  el.textContent = msg;
+  el.hidden = false;
+}
+
+async function onAuthSubmit(e) {
+  e.preventDefault();
+  const key = $('#auth-key').value.trim();
+  if (!key) return;
+  const btn = $('#auth-submit');
+  btn.disabled = true;
+  btn.textContent = 'Doğrulanıyor…';
+  try {
+    const d = await requestToken(key); // {token, expires_in}
+    setToken(d.token);
+    hideAuthPanel();
+    updateLogoutButton();
+    state.store = null; // yeni kimlikle mağaza yeniden çekilsin
+    await bootstrap(false);
+    renderCurrent();
+  } catch (err) {
+    if (isV2Missing(err)) {
+      setAuthPanelError('Backend token ucunu henüz desteklemiyor (POST /v1/auth/token — v2 bekleniyor).');
+    } else if (err instanceof ApiError && err.status === 401) {
+      setAuthPanelError('API anahtarı reddedildi — lütfen kontrol edip yeniden deneyin.');
+    } else {
+      setAuthPanelError(friendly(err));
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Giriş yap';
+  }
+}
+
+function onLogout() {
+  clearToken(); // kayıtlı token silinir; api.js 'demo'ya döner (§9)
+  updateLogoutButton();
+  hideAuthPanel();
+  state.store = null;
+  bootstrap(false).finally(() => renderCurrent());
+}
+
+function updateLogoutButton() {
+  const btn = $('#btn-logout');
+  if (btn) btn.hidden = !hasStoredToken();
+}
+
+function wireAuth() {
+  onUnauthorized(() => showAuthPanel());
+  const form = $('#auth-form');
+  if (form) form.addEventListener('submit', onAuthSubmit);
+  const cancel = $('#auth-cancel');
+  if (cancel) cancel.addEventListener('click', hideAuthPanel);
+  const logout = $('#btn-logout');
+  if (logout) logout.addEventListener('click', onLogout);
+  updateLogoutButton();
+}
+
 async function bootstrap(rerenderOnSuccess = false) {
   try {
     const data = await apiGet('/v1/stores');
@@ -431,6 +511,7 @@ function renderCurrent() {
     zones: viewZones,
     queue: viewQueue,
     briefing: viewBriefing,
+    admin: viewAdmin,
   };
   (views[state.tab] || viewOverview)(root);
 }
@@ -962,11 +1043,92 @@ async function viewQueue(root) {
         <span class="panel-note" id="q-upd"></span>
       </div>
       <div id="q-chart" class="chart chart--tall"><div class="state-msg">Yükleniyor…</div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Alarm geçmişi</h2>
+        <span class="panel-note">eşik aşağıdan yukarı aşılınca kayıt açılır (§11) · webhook teslimi ✓/✗</span>
+      </div>
+      <div id="al-body"><div class="state-msg">Yükleniyor…</div></div>
     </section>`;
 
+  fillAlerts(currentRange()); // alarm geçmişi seçili tarih aralığını izler
   await fillQueue(true);
   if (isStale(epoch)) return; // kullanıcı bu arada sekme değiştirdi (C11)
   startQueuePolling();
+}
+
+// --- alarm geçmişi (CONTRACTS §11) -------------------------------------------
+
+function normalizeAlerts(d) {
+  const list = Array.isArray(d) ? d : (d?.alerts ?? d?.items ?? []);
+  if (!Array.isArray(list)) return [];
+  const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+  return list
+    .map((a) => {
+      let payload = a?.payload_json ?? a?.payload ?? {};
+      if (typeof payload === 'string') {
+        try { payload = JSON.parse(payload); } catch { payload = {}; }
+      }
+      if (payload == null || typeof payload !== 'object') payload = {};
+      const deliveredRaw = a?.delivered ?? a?.delivered_bool ?? null;
+      return {
+        ts: parseTs(a?.ts ?? a?.time ?? a?.created_at ?? payload.ts),
+        type: String(a?.type ?? payload.type ?? ''),
+        zoneId: a?.zone_id ?? payload.zone_id ?? null,
+        len: num(a?.queue_len ?? payload.queue_len),
+        wait: num(a?.est_wait_sec ?? payload.est_wait_sec),
+        delivered: deliveredRaw == null ? null : Boolean(deliveredRaw),
+      };
+    })
+    .filter((a) => a.ts);
+}
+
+async function fillAlerts(r) {
+  const epoch = renderEpoch;
+  const el = $('#al-body');
+  if (!el) return;
+  try {
+    await ensureStore(); // zone_id → ad çevirisi için
+    const d = await apiGet(`/v1/stores/${state.storeId}/alerts` + qs({
+      from: r.fromIso, to: r.toIso,
+    }));
+    if (isStale(epoch)) return; // görünüm değişti (C11)
+    const alerts = normalizeAlerts(d).sort((a, b) => b.ts - a.ts);
+    if (!alerts.length) {
+      showState(el, 'Bu aralıkta alarm kaydı yok.');
+      return;
+    }
+    el.innerHTML = alertsTableHtml(alerts);
+  } catch (err) {
+    if (isStale(epoch)) return;
+    showV2State(el, err, 'GET /v1/stores/{id}/alerts');
+  }
+}
+
+const ALERT_TYPE_TR = { queue_length: 'Kuyruk uzunluğu', queue_wait: 'Bekleme süresi' };
+
+function alertsTableHtml(alerts) {
+  const deliveredCell = (v) => {
+    if (v == null) return '<td class="num muted">—</td>';
+    return v
+      ? '<td class="num"><span class="deliv deliv--ok" title="Webhook teslim edildi">✓</span></td>'
+      : '<td class="num"><span class="deliv deliv--fail" title="Webhook teslim edilemedi (delivered=false)">✗</span></td>';
+  };
+  const rows = alerts.map((a) => {
+    const when = a.ts ? `${fmtDay(a.ts)} ${fmtClock(a.ts)}` : '—';
+    const type = ALERT_TYPE_TR[a.type] ?? a.type ?? '—';
+    const zone = a.zoneId != null ? zoneNameById(a.zoneId) : '—';
+    return `<tr><td>${escapeHtml(when)}</td><td>${escapeHtml(type)}</td>` +
+      `<td>${escapeHtml(zone)}</td>` +
+      `<td class="num">${escapeHtml(a.len != null ? fmtInt(a.len) + ' kişi' : '—')}</td>` +
+      `<td class="num">${escapeHtml(a.wait != null ? fmtDur(a.wait) : '—')}</td>` +
+      deliveredCell(a.delivered) + '</tr>';
+  }).join('');
+  return '<div class="table-scroll"><table class="data-table">' +
+    '<thead><tr><th scope="col">Zaman</th><th scope="col">Tip</th><th scope="col">Bölge</th>' +
+    '<th scope="col">Kuyruk</th><th scope="col">Bekleme</th><th scope="col">Webhook</th></tr></thead>' +
+    `<tbody>${rows}</tbody></table></div>`;
 }
 
 async function fillQueue(first) {
@@ -1162,11 +1324,471 @@ async function onAssistantAsk(e) {
 }
 
 // ---------------------------------------------------------------------------
+// 6) Yönetim (CONTRACTS §10) — mağaza ayarları, bölge editörü, cihazlar
+// ---------------------------------------------------------------------------
+
+async function viewAdmin(root) {
+  const epoch = renderEpoch;
+  root.innerHTML = `
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Mağaza ayarları</h2>
+        <span class="panel-note">PUT /v1/stores/{id} — kısmi güncelleme</span>
+      </div>
+      <div id="ad-settings"><div class="state-msg">Yükleniyor…</div></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Bölge editörü</h2>
+        <span class="panel-note">köşe sürükleme bu sürümde yok — şekli değiştirmek için silip yeniden çizin</span>
+      </div>
+      <div id="ad-zones"><div class="state-msg">Yükleniyor…</div></div>
+      <div class="warn-note">Bölge değişiklikleri kenar cihaza <strong>otomatik yansımaz</strong>:
+        kenar, bölge poligonlarını kendi YAML config'inden okur (CONTRACTS §10 notu).
+        Üretim yolu imzalı config push'tur; şimdilik kenar config'ini elle güncelleyin.</div>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Kenar cihazları</h2>
+        <span class="panel-note">GET /v1/stores/{id}/devices · heartbeat &lt; 2 dk = çevrimiçi</span>
+      </div>
+      <div id="ad-devices"><div class="state-msg">Yükleniyor…</div></div>
+    </section>`;
+
+  fillDevices(epoch);
+  try {
+    const store = await ensureStore();
+    if (isStale(epoch)) return; // görünüm değişti (C11)
+    renderStoreSettings($('#ad-settings'), store, epoch);
+    renderZoneEditor($('#ad-zones'), store, epoch);
+  } catch (err) {
+    if (isStale(epoch)) return;
+    showError($('#ad-settings'), err);
+    showError($('#ad-zones'), err);
+  }
+}
+
+// --- (a) mağaza ayarları formu ----------------------------------------------
+
+function renderStoreSettings(el, store, epoch) {
+  el.innerHTML = `
+    <form id="st-form" class="form-grid">
+      <div class="field">
+        <label for="st-name">Mağaza adı</label>
+        <input id="st-name" maxlength="120" required value="${escapeHtml(store.name)}">
+      </div>
+      <div class="field">
+        <label for="st-w">Plan genişliği (m)</label>
+        <input id="st-w" type="number" min="1" max="1000" step="0.1" required value="${escapeHtml(store.planW)}">
+      </div>
+      <div class="field">
+        <label for="st-h">Plan yüksekliği (m)</label>
+        <input id="st-h" type="number" min="1" max="1000" step="0.1" required value="${escapeHtml(store.planH)}">
+      </div>
+      <div class="field">
+        <label for="st-tz">Zaman dilimi</label>
+        <input id="st-tz" maxlength="60" placeholder="Europe/Istanbul" value="${escapeHtml(store.timezone)}">
+      </div>
+      <div class="field field--wide">
+        <label for="st-wh">Webhook URL — kuyruk alarmları buraya POST edilir (§11); boş bırakılırsa kapalı</label>
+        <input id="st-wh" type="url" maxlength="400" placeholder="https://ornek.tld/wherugo-alarm" value="${escapeHtml(store.webhookUrl)}">
+      </div>
+      <div class="form-actions field--wide">
+        <button type="submit" class="btn btn--primary" id="st-save">Kaydet</button>
+        <span class="form-msg" id="st-msg"></span>
+      </div>
+    </form>`;
+
+  $('#st-form', el).addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = $('#st-msg', el);
+    const name = $('#st-name', el).value.trim();
+    const w = Number($('#st-w', el).value);
+    const h = Number($('#st-h', el).value);
+    const tz = $('#st-tz', el).value.trim();
+    const webhook = $('#st-wh', el).value.trim();
+    if (!name) { setFormMsg(msg, 'Mağaza adı boş olamaz.', 'err'); return; }
+    if (!(w > 0) || !(h > 0)) { setFormMsg(msg, 'Plan boyutları pozitif olmalı.', 'err'); return; }
+    // Kısmi güncelleme (§10): webhook_url boşsa null gönderilir (alanı temizler).
+    const body = { name, plan_width_m: w, plan_height_m: h, webhook_url: webhook || null };
+    if (tz) body.timezone = tz;
+    const btn = $('#st-save', el);
+    btn.disabled = true;
+    setFormMsg(msg, 'Kaydediliyor…');
+    try {
+      await apiPut(`/v1/stores/${state.storeId}`, body);
+      await refreshStore(); // üst bar adı + diğer sekmeler taze veriyi görsün
+      if (isStale(epoch) || !el.isConnected) return;
+      setFormMsg(msg, 'Kaydedildi.', 'ok');
+    } catch (err) {
+      if (isStale(epoch) || !el.isConnected) return;
+      setFormMsg(msg, isV2Missing(err)
+        ? 'Backend mağaza güncellemeyi henüz desteklemiyor (PUT /v1/stores/{id} — v2 bekleniyor).'
+        : friendly(err), 'err');
+    } finally {
+      if (el.isConnected) btn.disabled = false;
+    }
+  });
+}
+
+// --- (b) bölge editörü ---------------------------------------------------------
+// Plan canvas'ı ısı haritasıyla aynı görsel dili kullanır. "Yeni bölge" modunda
+// tıklamalar poligon köşesi ekler (metre, 2 ondalık); çift tık veya "Bitir"
+// poligonu kapatıp POST /v1/stores/{id}/zones çağırır. Köşe sürükleyerek
+// düzenleme v1'de bilinçli olarak yok (CONTRACTS notu): sil + yeniden çiz.
+
+function renderZoneEditor(el, store, epoch, notice = '') {
+  const draft = { drawing: false, pts: [] }; // pts: [[x_m, y_m], ...]
+  const typeOptions = Object.entries(ZONE_TYPE_TR).map(([v, l]) =>
+    `<option value="${escapeHtml(v)}">${escapeHtml(l)}</option>`).join('');
+
+  el.innerHTML = `
+    <div class="zed-layout">
+      <div>
+        <div class="zed-toolbar">
+          <button type="button" class="btn" id="zed-new">Yeni bölge</button>
+          <span class="zed-hint" id="zed-hint">Yeni bölge çizmek için "Yeni bölge"ye tıklayın.</span>
+        </div>
+        <div class="zed-canvas-wrap"><canvas id="zed-canvas" class="zed-canvas"></canvas></div>
+        <div id="zed-draft" class="zed-draft" hidden>
+          <h3>Yeni bölge</h3>
+          <div class="form-grid">
+            <div class="field">
+              <label for="zed-name">Ad</label>
+              <input id="zed-name" maxlength="80" placeholder="örn. Aksesuar Reyonu">
+            </div>
+            <div class="field">
+              <label for="zed-type">Tip</label>
+              <select id="zed-type">${typeOptions}</select>
+            </div>
+            <div class="field">
+              <label for="zed-cat">Kategori (isteğe bağlı)</label>
+              <input id="zed-cat" maxlength="80" placeholder="örn. kadın giyim">
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn--primary" id="zed-finish" disabled>Bitir (0 köşe)</button>
+            <button type="button" class="btn" id="zed-cancel">İptal</button>
+            <span class="form-msg" id="zed-msg"></span>
+          </div>
+        </div>
+      </div>
+      <div>
+        <div class="form-msg" id="zlist-msg"></div>
+        <div class="zone-list" id="zed-list">${
+          store.zones.length
+            ? store.zones.map((z) => zoneRowHtml(z)).join('')
+            : '<div class="state-msg">Tanımlı bölge yok — soldaki plandan ilk bölgeyi çizin.</div>'
+        }</div>
+      </div>
+    </div>`;
+
+  const listMsg = $('#zlist-msg', el);
+  if (notice) setFormMsg(listMsg, notice, 'ok');
+
+  const canvas = $('#zed-canvas', el);
+  let scale = drawEditorCanvas(canvas, store, draft);
+
+  const round2 = (v) => Math.round(v * 100) / 100;
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+  function updateDraftUi() {
+    const finish = $('#zed-finish', el);
+    finish.disabled = draft.pts.length < 3;
+    finish.textContent = `Bitir (${draft.pts.length} köşe)`;
+    $('#zed-hint', el).textContent = draft.drawing
+      ? 'Köşe eklemek için plana tıklayın (en az 3). Çift tık veya "Bitir" poligonu kapatır.'
+      : 'Yeni bölge çizmek için "Yeni bölge"ye tıklayın.';
+  }
+
+  canvas.addEventListener('click', (e) => {
+    if (!draft.drawing) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = round2(clamp((e.clientX - rect.left) / scale, 0, store.planW));
+    const y = round2(clamp((e.clientY - rect.top) / scale, 0, store.planH));
+    const last = draft.pts[draft.pts.length - 1];
+    // Çift tık iki click üretir: son köşenin dibindeki tekrarı yut.
+    if (last && Math.hypot(last[0] - x, last[1] - y) < 0.15) return;
+    draft.pts.push([x, y]);
+    scale = drawEditorCanvas(canvas, store, draft);
+    updateDraftUi();
+  });
+
+  canvas.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    if (draft.drawing && draft.pts.length >= 3) submitNewZone();
+  });
+
+  $('#zed-new', el).addEventListener('click', () => {
+    draft.drawing = true;
+    draft.pts = [];
+    $('#zed-draft', el).hidden = false;
+    $('#zed-new', el).disabled = true;
+    canvas.classList.add('is-drawing');
+    setFormMsg($('#zed-msg', el), '');
+    scale = drawEditorCanvas(canvas, store, draft);
+    updateDraftUi();
+  });
+
+  $('#zed-cancel', el).addEventListener('click', () => {
+    draft.drawing = false;
+    draft.pts = [];
+    $('#zed-draft', el).hidden = true;
+    $('#zed-new', el).disabled = false;
+    canvas.classList.remove('is-drawing');
+    scale = drawEditorCanvas(canvas, store, draft);
+    updateDraftUi();
+  });
+
+  $('#zed-finish', el).addEventListener('click', submitNewZone);
+
+  async function submitNewZone() {
+    const msg = $('#zed-msg', el);
+    const name = $('#zed-name', el).value.trim();
+    const zoneType = $('#zed-type', el).value;
+    const category = $('#zed-cat', el).value.trim();
+    if (draft.pts.length < 3) { setFormMsg(msg, 'En az 3 köşe gerekli.', 'err'); return; }
+    if (!name) {
+      setFormMsg(msg, 'Bölge adı gerekli.', 'err');
+      $('#zed-name', el).focus();
+      return;
+    }
+    // CONTRACTS §10: {name, zone_type, polygon, category?} — polygon plan
+    // koordinatında (metre) [[x,y], ...] köşe listesi olarak gönderilir.
+    const body = { name, zone_type: zoneType, polygon: draft.pts.map((p) => [p[0], p[1]]) };
+    if (category) body.category = category;
+    const finish = $('#zed-finish', el);
+    finish.disabled = true;
+    setFormMsg(msg, 'Kaydediliyor…');
+    try {
+      await apiPost(`/v1/stores/${state.storeId}/zones`, body);
+      const fresh = await refreshStore(); // ısı haritası dahil herkes yeni bölgeyi görür
+      if (isStale(epoch) || !el.isConnected) return;
+      renderZoneEditor(el, fresh, epoch, `"${name}" bölgesi eklendi.`);
+    } catch (err) {
+      if (isStale(epoch) || !el.isConnected) return;
+      finish.disabled = draft.pts.length < 3;
+      setFormMsg(msg, isV2Missing(err)
+        ? 'Backend bölge eklemeyi henüz desteklemiyor (POST /v1/stores/{id}/zones — v2 bekleniyor).'
+        : friendly(err), 'err');
+    }
+  }
+
+  // Bölge listesi: kaydet (PUT) / sil (DELETE) — tek delegasyon.
+  $('#zed-list', el).addEventListener('click', async (e) => {
+    const row = e.target.closest('.zone-row');
+    if (!row) return;
+    const zid = row.dataset.zid;
+    const zone = store.zones.find((z) => String(z.id) === String(zid));
+    if (!zone) return;
+    const buttons = $$('button', row);
+
+    if (e.target.closest('[data-zsave]')) {
+      const name = row.querySelector('[data-f="name"]').value.trim();
+      const zoneType = row.querySelector('[data-f="type"]').value;
+      const category = row.querySelector('[data-f="cat"]').value.trim();
+      if (!name) { setFormMsg(listMsg, 'Bölge adı boş olamaz.', 'err'); return; }
+      buttons.forEach((b) => { b.disabled = true; });
+      setFormMsg(listMsg, `"${name}" kaydediliyor…`);
+      try {
+        // Poligon burada değiştirilemez (köşe sürükleme v1'de yok) — yalnız
+        // ad/tip/kategori güncellenir; sunucu poligonu korur (kısmi güncelleme).
+        await apiPut(`/v1/stores/${state.storeId}/zones/${zid}`,
+          { name, zone_type: zoneType, category: category || null });
+        const fresh = await refreshStore();
+        if (isStale(epoch) || !el.isConnected) return;
+        renderZoneEditor(el, fresh, epoch, `"${name}" güncellendi.`);
+      } catch (err) {
+        if (isStale(epoch) || !el.isConnected) return;
+        buttons.forEach((b) => { b.disabled = false; });
+        setFormMsg(listMsg, isV2Missing(err)
+          ? 'Backend bölge güncellemeyi henüz desteklemiyor (PUT /v1/stores/{id}/zones/{zid} — v2 bekleniyor).'
+          : friendly(err), 'err');
+      }
+      return;
+    }
+
+    if (e.target.closest('[data-zdel]')) {
+      if (!window.confirm(`"${zone.name}" bölgesi silinsin mi?\nGeçmiş ziyaret verisi korunur (CONTRACTS §10).`)) return;
+      buttons.forEach((b) => { b.disabled = true; });
+      setFormMsg(listMsg, `"${zone.name}" siliniyor…`);
+      try {
+        await apiDelete(`/v1/stores/${state.storeId}/zones/${zid}`);
+        const fresh = await refreshStore();
+        if (isStale(epoch) || !el.isConnected) return;
+        renderZoneEditor(el, fresh, epoch, `"${zone.name}" silindi.`);
+      } catch (err) {
+        if (isStale(epoch) || !el.isConnected) return;
+        buttons.forEach((b) => { b.disabled = false; });
+        setFormMsg(listMsg, isV2Missing(err)
+          ? 'Backend bölge silmeyi henüz desteklemiyor (DELETE /v1/stores/{id}/zones/{zid} — v2 bekleniyor).'
+          : friendly(err), 'err');
+      }
+    }
+  });
+}
+
+function zoneRowHtml(z) {
+  const known = Object.prototype.hasOwnProperty.call(ZONE_TYPE_TR, z.type);
+  const options = Object.entries(ZONE_TYPE_TR).map(([v, l]) =>
+    `<option value="${escapeHtml(v)}"${v === z.type ? ' selected' : ''}>${escapeHtml(l)}</option>`).join('') +
+    (known ? '' : `<option value="${escapeHtml(z.type)}" selected>${escapeHtml(z.type)}</option>`);
+  return `<div class="zone-row" data-zid="${escapeHtml(z.id)}">
+    <input data-f="name" maxlength="80" aria-label="Bölge adı" value="${escapeHtml(z.name)}">
+    <select data-f="type" aria-label="Bölge tipi">${options}</select>
+    <input data-f="cat" maxlength="80" placeholder="kategori" aria-label="Kategori" value="${escapeHtml(z.category)}">
+    <button type="button" class="btn btn--sm" data-zsave>Kaydet</button>
+    <button type="button" class="btn btn--sm btn--danger" data-zdel>Sil</button>
+    ${z.poly ? '' : '<div class="zone-nopoly">Poligon tanımsız — planda ve ısı haritasında çizilemez.</div>'}
+  </div>`;
+}
+
+/** Plan + mevcut bölgeler + çizilmekte olan taslak poligon; px/metre ölçeğini döner. */
+function drawEditorCanvas(canvas, store, draft) {
+  const wrap = canvas.parentElement;
+  const cssW = Math.max(300, Math.min(wrap.clientWidth || 640, 760));
+  const scale = cssW / store.planW;
+  const cssH = Math.round(store.planH * scale);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return scale;
+  ctx.scale(dpr, dpr);
+
+  // Zemin + metre gridi (ısı haritasıyla aynı görsel dil)
+  ctx.fillStyle = '#f6f5f1';
+  ctx.fillRect(0, 0, cssW, cssH);
+  ctx.strokeStyle = COLORS.grid;
+  ctx.lineWidth = 1;
+  for (let gx = 5; gx < store.planW; gx += 5) {
+    ctx.beginPath(); ctx.moveTo(gx * scale + 0.5, 0); ctx.lineTo(gx * scale + 0.5, cssH); ctx.stroke();
+  }
+  for (let gy = 5; gy < store.planH; gy += 5) {
+    ctx.beginPath(); ctx.moveTo(0, gy * scale + 0.5); ctx.lineTo(cssW, gy * scale + 0.5); ctx.stroke();
+  }
+
+  // Mevcut bölgeler
+  ctx.font = `11px ${'system-ui, sans-serif'}`;
+  for (const z of store.zones) {
+    if (!z.poly) continue;
+    ctx.beginPath();
+    z.poly.forEach(([px, py], i) => {
+      if (i) ctx.lineTo(px * scale, py * scale); else ctx.moveTo(px * scale, py * scale);
+    });
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(42,120,214,0.06)';
+    ctx.fill();
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(11,11,11,0.45)';
+    ctx.stroke();
+
+    const cx = z.poly.reduce((a, p) => a + p[0], 0) / z.poly.length * scale;
+    const cy = z.poly.reduce((a, p) => a + p[1], 0) / z.poly.length * scale;
+    const w = ctx.measureText(z.name).width;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(252,252,251,0.9)';
+    ctx.strokeText(z.name, cx - w / 2, cy + 4);
+    ctx.fillStyle = COLORS.inkSecondary;
+    ctx.fillText(z.name, cx - w / 2, cy + 4);
+  }
+
+  // Taslak poligon (çizim modunda): mavi kesikli kontur + köşe noktaları
+  if (draft && draft.pts.length) {
+    ctx.beginPath();
+    draft.pts.forEach(([px, py], i) => {
+      if (i) ctx.lineTo(px * scale, py * scale); else ctx.moveTo(px * scale, py * scale);
+    });
+    if (draft.pts.length >= 3) ctx.closePath();
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = COLORS.blue;
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (draft.pts.length >= 3) {
+      ctx.fillStyle = 'rgba(42,120,214,0.12)';
+      ctx.fill();
+    }
+    draft.pts.forEach(([px, py], i) => {
+      ctx.beginPath();
+      ctx.arc(px * scale, py * scale, i === 0 ? 5 : 4, 0, Math.PI * 2);
+      ctx.fillStyle = i === 0 ? COLORS.surface : COLORS.blue;
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = COLORS.blue;
+      ctx.stroke();
+    });
+  }
+
+  // Çerçeve
+  ctx.strokeStyle = COLORS.axis;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0.5, 0.5, cssW - 1, cssH - 1);
+  return scale;
+}
+
+// --- (c) cihaz listesi -----------------------------------------------------------
+
+function normalizeDevices(d) {
+  const list = Array.isArray(d) ? d : (d?.devices ?? d?.items ?? []);
+  if (!Array.isArray(list)) return [];
+  return list.map((x) => ({
+    id: x?.id ?? x?.device_id ?? '—',
+    name: x?.name ?? String(x?.id ?? '—'),
+    hb: parseTs(x?.last_heartbeat ?? x?.heartbeat ?? x?.last_seen),
+    online: typeof x?.online === 'boolean' ? x.online : null,
+  }));
+}
+
+function deviceBadgeHtml(dev) {
+  const online = dev.online != null
+    ? dev.online
+    : (dev.hb ? (Date.now() - dev.hb.getTime()) < DEVICE_ONLINE_MS : null);
+  if (online === true) {
+    return '<span class="dev-badge dev-badge--on"><span class="q-dot" aria-hidden="true"></span>Çevrimiçi</span>';
+  }
+  if (online === false) {
+    return '<span class="dev-badge dev-badge--off"><span class="q-dot" aria-hidden="true"></span>Çevrimdışı</span>';
+  }
+  return '<span class="dev-badge dev-badge--unknown"><span class="q-dot" aria-hidden="true"></span>Bilinmiyor</span>';
+}
+
+async function fillDevices(epoch) {
+  const el = $('#ad-devices');
+  if (!el) return;
+  try {
+    const d = await apiGet(`/v1/stores/${state.storeId}/devices`);
+    if (isStale(epoch)) return; // görünüm değişti (C11)
+    const devices = normalizeDevices(d);
+    if (!devices.length) {
+      showState(el, 'Kayıtlı kenar cihazı yok.');
+      return;
+    }
+    const rows = devices.map((dev) => {
+      const hb = dev.hb ? `${fmtDay(dev.hb)} ${fmtClock(dev.hb)}` : '—';
+      return `<tr><td>${escapeHtml(dev.id)}</td><td>${escapeHtml(dev.name)}</td>` +
+        `<td class="num">${escapeHtml(hb)}</td><td>${deviceBadgeHtml(dev)}</td></tr>`;
+    }).join('');
+    el.innerHTML = '<div class="table-scroll"><table class="data-table">' +
+      '<thead><tr><th scope="col">Cihaz ID</th><th scope="col">Ad</th>' +
+      '<th scope="col">Son heartbeat</th><th scope="col">Durum</th></tr></thead>' +
+      `<tbody>${rows}</tbody></table></div>`;
+  } catch (err) {
+    if (isStale(epoch)) return;
+    showV2State(el, err, 'GET /v1/stores/{id}/devices');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Başlangıç
 // ---------------------------------------------------------------------------
 
 function init() {
   wireTopbar();
+  wireAuth();
   // Backend kapalı olsa bile sayfa kurulur; paneller kendi durumunu gösterir.
   bootstrap(false).finally(() => renderCurrent());
 }

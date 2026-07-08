@@ -55,7 +55,75 @@ class StoreOut(BaseModel):
     plan_width_m: float
     plan_height_m: float
     timezone: str
+    # v2: alert webhook target (CONTRACTS section 11); null when unset.
+    webhook_url: Optional[str] = None
     zones: list[ZoneOut] = Field(default_factory=list)
+
+
+# --- auth v2 (CONTRACTS section 9) --------------------------------------------
+
+class TokenRequest(BaseModel):
+    api_key: str
+
+
+class TokenResponse(BaseModel):
+    token: str
+    expires_in: int
+
+
+# --- management API (CONTRACTS section 10) -------------------------------------
+
+ZONE_TYPE_PATTERN = "^(entrance|shelf|queue|checkout|fitting_room|other)$"
+
+
+class StoreCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    plan_width_m: float = Field(gt=0)
+    plan_height_m: float = Field(gt=0)
+    timezone: str = "Europe/Istanbul"
+    webhook_url: Optional[str] = None
+
+
+class StoreUpdate(BaseModel):
+    """Partial update: only fields present in the request body are applied."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    plan_width_m: Optional[float] = Field(default=None, gt=0)
+    plan_height_m: Optional[float] = Field(default=None, gt=0)
+    timezone: Optional[str] = None
+    webhook_url: Optional[str] = None
+
+
+class ZoneCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    zone_type: str = Field(pattern=ZONE_TYPE_PATTERN)
+    polygon: list[list[float]] = Field(min_length=3)
+    category: Optional[str] = None
+
+
+class ZoneUpdate(BaseModel):
+    """Partial update: only fields present in the request body are applied."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    zone_type: Optional[str] = Field(default=None, pattern=ZONE_TYPE_PATTERN)
+    polygon: Optional[list[list[float]]] = Field(default=None, min_length=3)
+    category: Optional[str] = None
+
+
+class DeviceCreate(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    name: str = ""
+
+
+# --- alerts (CONTRACTS section 11) ----------------------------------------------
+
+class AlertOut(BaseModel):
+    id: int
+    store_id: int
+    zone_id: int
+    type: str  # queue_length | queue_wait
+    ts: str
+    queue_len: Optional[int] = None
+    est_wait_sec: Optional[float] = None
+    delivered: bool
 
 
 # --- metrics ----------------------------------------------------------------

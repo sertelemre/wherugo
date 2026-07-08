@@ -481,6 +481,75 @@ def funnel(session: Session, store_id: int, t_from: datetime, t_to: datetime) ->
     }
 
 
+# --- export rollup (CONTRACTS section 12) --------------------------------------------
+
+def hourly_zone_rollup(session: Session, store_id: int,
+                       t_from: datetime, t_to: datetime) -> list[dict[str, Any]]:
+    """Hourly per-zone aggregate for CSV export. NEVER exposes raw track data.
+
+    Columns: hour (UTC hour bucket), zone_id, zone_name, visits,
+    unique_visitors, dwell_p50, dwell_p95, queue_max, queue_abandons.
+    k-anonymity: rows with unique_visitors < K_ANONYMITY keep their counts but
+    the dwell percentiles are None (blank in the CSV) — a small group's exact
+    dwell time must not leak."""
+    visit_rows = session.execute(
+        select(ZoneVisit.zone_id, ZoneVisit.track_id, ZoneVisit.enter_ts, ZoneVisit.dwell_sec)
+        .where(ZoneVisit.store_id == store_id,
+               ZoneVisit.is_staff == False,  # noqa: E712
+               ZoneVisit.enter_ts >= t_from,
+               ZoneVisit.enter_ts <= t_to)
+    ).all()
+    buckets: dict[tuple[datetime, int], dict[str, Any]] = {}
+
+    def bucket(hour: datetime, zone_id: int) -> dict[str, Any]:
+        return buckets.setdefault((hour, zone_id), {
+            "visits": 0, "tracks": set(), "dwells": [],
+            "queue_max": None, "queue_abandons": None,
+        })
+
+    for zone_id, track_id, enter_ts, dwell_sec in visit_rows:
+        b = bucket(enter_ts.replace(minute=0, second=0, microsecond=0), zone_id)
+        b["visits"] += 1
+        b["tracks"].add(track_id)
+        if dwell_sec is not None:
+            b["dwells"].append(float(dwell_sec))
+
+    queue_rows = session.execute(
+        select(QueueSample.zone_id, QueueSample.ts, QueueSample.queue_len, QueueSample.abandons)
+        .where(QueueSample.store_id == store_id,
+               QueueSample.ts >= t_from,
+               QueueSample.ts <= t_to)
+    ).all()
+    for zone_id, ts, queue_len, abandons in queue_rows:
+        b = bucket(ts.replace(minute=0, second=0, microsecond=0), zone_id)
+        b["queue_max"] = max(b["queue_max"] or 0, int(queue_len))
+        b["queue_abandons"] = (b["queue_abandons"] or 0) + int(abandons or 0)
+
+    zone_names = dict(session.execute(
+        select(Zone.id, Zone.name).where(Zone.store_id == store_id)).all())
+    out: list[dict[str, Any]] = []
+    for (hour, zone_id) in sorted(buckets):
+        b = buckets[(hour, zone_id)]
+        unique = len(b["tracks"])
+        suppress = unique < K_ANONYMITY
+        out.append({
+            "hour": hour.isoformat() + "Z",
+            "zone_id": zone_id,
+            "zone_name": zone_names.get(zone_id, str(zone_id)),
+            "visits": b["visits"],
+            "unique_visitors": unique,
+            "dwell_p50": None if suppress else _round1(percentile(b["dwells"], 50.0)),
+            "dwell_p95": None if suppress else _round1(percentile(b["dwells"], 95.0)),
+            "queue_max": b["queue_max"],
+            "queue_abandons": b["queue_abandons"],
+        })
+    return out
+
+
+def _round1(value: float | None) -> float | None:
+    return None if value is None else round(value, 1)
+
+
 def coverage_gaps(session: Session, store_id: int, t_from: datetime, t_to: datetime) -> dict[str, Any]:
     """Gaps intersecting the window. duration_sec/total_minutes count only the
     portion of each gap that overlaps [t_from, t_to] (same clipping as

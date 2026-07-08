@@ -176,19 +176,28 @@ def _project(session: Session, ev: dict[str, Any]) -> dict[str, Any] | None:
     elif etype == "queue_measurement":
         zone_id = ev.get("zone_id")
         if zone_id is None:
-            return
+            return None
+        zone_id = int(zone_id)
+        queue_len = int(ev.get("queue_len", 0))
+        est_wait_raw = ev.get("est_wait_sec")
+        est_wait = float(est_wait_raw) if est_wait_raw is not None else None
+        # Alert rising-edge check MUST run before the new sample is inserted:
+        # the "previous state" is the latest stored sample of this zone.
+        job = alerts.maybe_open_alert(session, store_id, zone_id, ts, queue_len, est_wait)
         session.add(QueueSample(
             store_id=store_id,
-            zone_id=int(zone_id),
+            zone_id=zone_id,
             ts=ts,
-            queue_len=int(ev.get("queue_len", 0)),
-            est_wait_sec=ev.get("est_wait_sec"),
+            queue_len=queue_len,
+            est_wait_sec=est_wait,
             joins=int(ev.get("joins_since_last", ev.get("joins", 0)) or 0),
             abandons=int(ev.get("abandons_since_last", ev.get("abandons", 0)) or 0),
             active_checkouts=int(ev.get("active_checkouts", 0) or 0),
         ))
+        return job
 
     # interaction_detected: kept in event_raw only (funnel reads it from there).
+    return None
 
 
 def _detect_gaps(session: Session, device_id: str, store_id: int,
@@ -319,7 +328,7 @@ def _process_batch_once(session: Session, tenant_id: str, raw_events: list[dict[
             # _project validates/coerces before any session mutation, so a
             # data error here leaves no partial state; the event_raw row is
             # only added once the projection succeeded.
-            _project(session, ev)
+            job = _project(session, ev)
             payload = {k: v for k, v in ev.items() if k not in ("event_time",)}
             payload["event_time"] = ev["event_time"].isoformat() + "Z"
             session.add(EventRaw(
@@ -336,6 +345,8 @@ def _process_batch_once(session: Session, tenant_id: str, raw_events: list[dict[
         except _EVENT_DATA_ERRORS:
             result.rejected += 1  # one poisoned event must not drop the batch
             continue
+        if job is not None:
+            result.webhook_jobs.append(job)
         result.accepted += 1
 
     session.commit()

@@ -33,6 +33,10 @@ services:
       dockerfile: deploy/Dockerfile.backend
     # Sabit imaj adı: mqtt-bridge aynı imajı yeniden build etmeden kullanır.
     image: wherugo-backend:local
+    # postgres profiliyle: PG backend'den sonra hazır olursa ilk başlatma düşer;
+    # on-failure PG ayağa kalkana dek yeniden dener (profil-koşullu depends_on
+    # compose'da yok). SQLite modunda etkisizdir.
+    restart: on-failure
     ports:
       - "8000:8000"
     volumes:

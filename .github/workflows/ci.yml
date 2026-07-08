@@ -1,0 +1,48 @@
+# CONTRACTS §17: push/PR'da 3 paketin pytest'i + dashboard JS söz dizimi kontrolü.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            ai/pyproject.toml
+            backend/pyproject.toml
+            edge/pyproject.toml
+
+      - name: Paketleri kur
+        # opencv-python-headless: edge video kaynağı testleri için (CONTRACTS §16);
+        # paho-mqtt: mqtt köprüsü/taşıma testleri için (CONTRACTS §13, backend[mqtt]).
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./ai -e ./backend -e ./edge pytest httpx opencv-python-headless 'paho-mqtt>=2'
+
+      - name: pytest (ai + backend + edge)
+        run: pytest ai/tests backend/tests edge/tests -q
+
+  dashboard-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: node --check (ESM) dashboard/*.js
+        run: |
+          set -euo pipefail
+          for f in dashboard/*.js; do
+            echo "kontrol: $f"
+            node --input-type=module --check < "$f"
+          done
