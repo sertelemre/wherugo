@@ -14,7 +14,7 @@ from .providers import (
     ProviderError,
     get_provider,
 )
-from .vlm import MockVLM, VLMJudge, VLMVerdict
+from .vlm import MockVLM, OpenAICompatVLM, VLMJudge, VLMVerdict, get_vlm
 
 __version__ = "0.1.0"
 
@@ -26,11 +26,13 @@ __all__ = [
     "MockProvider",
     "MockVLM",
     "OpenAICompatProvider",
+    "OpenAICompatVLM",
     "ProviderError",
     "VLMJudge",
     "VLMVerdict",
     "answer",
     "generate",
     "get_provider",
+    "get_vlm",
     "__version__",
 ]

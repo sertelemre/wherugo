@@ -35,6 +35,17 @@ class LLMProvider(Protocol):
     def complete(self, system: str, user: str, *, json_mode: bool = False) -> str: ...
 
 
+def _chat_completions_url(base_url: str) -> str:
+    """OpenAI-compat endpoint from a base URL, tolerating a trailing ``/v1``.
+
+    Shared by :class:`OpenAICompatProvider` (text) and
+    :class:`wherugo_ai.vlm.OpenAICompatVLM` (vision)."""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
 def _post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
     payload = json.dumps(body).encode("utf-8")
     all_headers = {"Content-Type": "application/json", **headers}
@@ -81,9 +92,7 @@ class OpenAICompatProvider:
         self.name = f"openai:{model}"
 
     def _endpoint(self) -> str:
-        if self.base_url.endswith("/v1"):
-            return self.base_url + "/chat/completions"
-        return self.base_url + "/v1/chat/completions"
+        return _chat_completions_url(self.base_url)
 
     def complete(self, system: str, user: str, *, json_mode: bool = False) -> str:
         body: dict[str, Any] = {
