@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest", "httpx"]
+mqtt = ["paho-mqtt>=2"]
 
 [tool.setuptools.packages.find]
 include = ["wherugo_backend*"]

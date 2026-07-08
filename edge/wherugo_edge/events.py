@@ -130,6 +130,9 @@ class InteractionDetected:
     quality: Quality
     interaction: str = "interaction_candidate"  # Faz 2: pickup | putback (rezerve)
     clip_ref: Optional[str] = None
+    # CONTRACTS §15: VLM hakem kararı (yalnız metin/float — piksel ASLA).
+    vlm_verdict: Optional[str] = None
+    vlm_conf: Optional[float] = None
 
     def payload(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -142,6 +145,10 @@ class InteractionDetected:
         }
         if self.clip_ref is not None:
             d["clip_ref"] = self.clip_ref
+        if self.vlm_verdict is not None:
+            d["vlm_verdict"] = str(self.vlm_verdict)
+        if self.vlm_conf is not None:
+            d["vlm_conf"] = round(float(self.vlm_conf), 3)
         return d
 
 

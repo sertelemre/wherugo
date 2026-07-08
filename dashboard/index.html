@@ -35,6 +35,8 @@
         </svg>
         Video buluta gitmez · KVKK-native
       </span>
+      <button type="button" id="btn-logout" class="btn btn--sm" hidden
+        title="Kayıtlı oturum token'ını siler; panel 'demo' token'ına döner.">Çıkış</button>
     </div>
   </header>
 
@@ -46,11 +48,33 @@
     <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="zones">Bölgeler</button>
     <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="queue">Kuyruk</button>
     <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="briefing">Brifing</button>
+    <button type="button" class="tab-btn" role="tab" aria-selected="false" data-tab="admin">Yönetim</button>
   </nav>
 
   <main id="view" class="view"></main>
 
   <div id="viz-tip" class="viz-tip" hidden></div>
+
+  <!-- Token giriş paneli (CONTRACTS §9): herhangi bir istek 401 dönerse açılır.
+       API anahtarı POST /v1/auth/token ile token'a çevrilir ve localStorage'da
+       saklanır; 'demo' token'ı hiçbir şey kaydedilmemişse varsayılandır. -->
+  <div id="auth-overlay" class="auth-overlay" hidden>
+    <div class="auth-card" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <h2 id="auth-title">Oturum doğrulama gerekli</h2>
+      <p class="auth-sub">Sunucu bu isteği reddetti (HTTP 401). API anahtarınızı girin;
+        karşılığında alınan oturum token'ı yalnız bu tarayıcıda saklanır.</p>
+      <form id="auth-form" class="auth-form">
+        <label for="auth-key">API anahtarı</label>
+        <input id="auth-key" name="api_key" type="password" autocomplete="off"
+          required placeholder="örn. demo-api-key">
+        <div id="auth-err" class="auth-err" role="alert" hidden></div>
+        <div class="auth-actions">
+          <button type="submit" class="btn btn--primary" id="auth-submit">Giriş yap</button>
+          <button type="button" class="btn" id="auth-cancel">Kapat</button>
+        </div>
+      </form>
+    </div>
+  </div>
 
   <noscript>
     <p style="padding:20px;text-align:center;color:#52514e">

@@ -10,6 +10,8 @@ import yaml
 from .homography import Homography
 
 ZONE_TYPES = {"entrance", "shelf", "queue", "checkout", "fitting_room", "other"}
+TRANSPORTS = {"http", "mqtt"}     # CONTRACTS §13
+DETECTORS = {"yolo", "mock"}      # CONTRACTS §16
 
 DEFAULT_HOURLY_CURVE = [
     0.30, 0.30, 0.30, 0.30, 0.30, 0.35, 0.40, 0.50, 0.60, 0.75, 0.90, 1.00,
@@ -70,12 +72,35 @@ class SimParams:
 
 
 @dataclass
+class MqttParams:
+    """MQTT taşıma ayarları (CONTRACTS §13); yalnız transport: mqtt iken kullanılır."""
+
+    host: str = "localhost"
+    port: int = 1883
+    qos: int = 1
+
+
+@dataclass
 class PublisherParams:
     spool_path: str = "wherugo-edge-spool.sqlite"
     batch_size: int = 200
     flush_interval_sec: float = 2.0
     # Spool'daki en fazla kayıt; aşılırsa en eskiler silinir (0 = sınırsız).
     spool_max_events: int = 200_000
+    # Taşıma: http (vars, mevcut davranış) | mqtt (üretim yolu, CONTRACTS §13).
+    transport: str = "http"
+    mqtt: MqttParams = field(default_factory=MqttParams)
+
+
+@dataclass
+class VideoParams:
+    """Video kaynağı ayarları (CONTRACTS §15/§16); yalnız --source video iken kullanılır."""
+
+    detector: str = "yolo"       # yolo (ultralytics, saha) | mock (GPU'suz, saf OpenCV)
+    clip_dir: str = "./clips"    # interaction klipleri (yalnız YEREL disk, 72 saat TTL)
+    clip_ttl_hours: float = 72.0
+    sample_hz: float = 1.0       # track başına örnekleme frekansı
+    model: str = "yolo11n.pt"    # yalnız detector: yolo için
 
 
 @dataclass
@@ -91,6 +116,7 @@ class EdgeConfig:
     engine: EngineParams = field(default_factory=EngineParams)
     simulation: SimParams = field(default_factory=SimParams)
     publisher: PublisherParams = field(default_factory=PublisherParams)
+    video: VideoParams = field(default_factory=VideoParams)
 
 
 def _require(data: dict, key: str, ctx: str) -> Any:
@@ -232,10 +258,48 @@ def config_from_dict(data: dict) -> EdgeConfig:
         batch_size=min(500, int(pub_raw.get("batch_size", 200))),
         flush_interval_sec=float(pub_raw.get("flush_interval_sec", 2.0)),
         spool_max_events=int(pub_raw.get("spool_max_events", 200_000)),
+        transport=str(pub_raw.get("transport", "http")),
+        mqtt=_parse_mqtt(pub_raw.get("mqtt", {}) or {}),
     )
     if cfg.publisher.spool_max_events < 0:
         raise ConfigError("publisher.spool_max_events negatif olamaz (0 = sınırsız)")
+    if cfg.publisher.transport not in TRANSPORTS:
+        raise ConfigError(
+            f"publisher.transport geçersiz: '{cfg.publisher.transport}' (izinli: {sorted(TRANSPORTS)})"
+        )
+
+    cfg.video = _parse_video(data.get("video", {}) or {})
     return cfg
+
+
+def _parse_mqtt(raw: dict) -> MqttParams:
+    mp = MqttParams(
+        host=str(raw.get("host", "localhost")),
+        port=int(raw.get("port", 1883)),
+        qos=int(raw.get("qos", 1)),
+    )
+    if not 1 <= mp.port <= 65535:
+        raise ConfigError(f"publisher.mqtt.port 1-65535 arasında olmalı: {mp.port}")
+    if mp.qos not in (0, 1, 2):
+        raise ConfigError(f"publisher.mqtt.qos 0, 1 veya 2 olmalı: {mp.qos}")
+    return mp
+
+
+def _parse_video(raw: dict) -> VideoParams:
+    vp = VideoParams(
+        detector=str(raw.get("detector", "yolo")),
+        clip_dir=str(raw.get("clip_dir", "./clips")),
+        clip_ttl_hours=float(raw.get("clip_ttl_hours", 72.0)),
+        sample_hz=float(raw.get("sample_hz", 1.0)),
+        model=str(raw.get("model", "yolo11n.pt")),
+    )
+    if vp.detector not in DETECTORS:
+        raise ConfigError(f"video.detector geçersiz: '{vp.detector}' (izinli: {sorted(DETECTORS)})")
+    if vp.clip_ttl_hours <= 0:
+        raise ConfigError("video.clip_ttl_hours pozitif olmalı")
+    if vp.sample_hz <= 0:
+        raise ConfigError("video.sample_hz pozitif olmalı")
+    return vp
 
 
 def load_config(path: str | Path) -> EdgeConfig:

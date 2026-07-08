@@ -15,14 +15,20 @@ Dayanıklılık sınırları:
   düşürülür ve stderr'e loglanır — bozuk batch sonsuz yeniden deneme
   döngüsüne giremez. Diğer hatalar (ağ, 5xx, 401...) geçici sayılır ve
   olaylar spool'da bekler.
+
+Taşıma soyutlaması (CONTRACTS §13): spool/at-least-once mantığı taşımadan
+bağımsızdır. ``publisher.transport: http`` (vars) mevcut HTTP batch POST'u,
+``mqtt`` ise paho-mqtt ile ``t/{tenant}/{store}/{device}/events`` konusuna
+QoS 1 yayın yapar; payload her iki yolda da aynı JSON batch'tir.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import requests
 
@@ -35,6 +41,126 @@ MAX_BATCH = 500  # CONTRACTS §2: <=500 olay/batch
 DEFAULT_MAX_SPOOL_EVENTS = 200_000
 # Yeniden denemenin asla düzeltemeyeceği istemci hataları: batch düşürülür.
 PERMANENT_REJECT_STATUSES = frozenset({400, 413, 422})
+
+_MQTT_HINT = (
+    "MQTT taşıması için paho-mqtt kurulu değil. "
+    "Kurulum: pip install 'wherugo-edge[mqtt]'  (veya publisher.transport: http kullanın)."
+)
+
+
+# -- taşıma soyutlaması (CONTRACTS §13) -----------------------------------
+
+
+@dataclass
+class SendResult:
+    """Bir batch gönderiminin sonucu: başarı / kalıcı red / geçici hata.
+
+    ok=False + permanent=False → geçici: batch spool'da kalır, tekrar denenir.
+    ok=False + permanent=True  → kalıcı red: batch düşürülür (sonsuz döngü yok).
+    """
+
+    ok: bool
+    permanent: bool = False
+    reason: str = ""
+
+
+class Transport(Protocol):
+    def send(self, wires: list[dict[str, Any]]) -> SendResult: ...
+
+    def close(self) -> None: ...
+
+
+class HttpTransport:
+    """Mevcut davranış: JSON batch'i ``POST /v1/ingest/events`` ile gönderir."""
+
+    def __init__(self, config: EdgeConfig, *, timeout_sec: float = 5.0) -> None:
+        self.url = config.backend_url.rstrip("/") + INGEST_PATH
+        self.auth_token = config.auth_token
+        self.timeout_sec = timeout_sec
+
+    def send(self, wires: list[dict[str, Any]]) -> SendResult:
+        try:
+            resp = requests.post(
+                self.url,
+                json={"events": wires},
+                headers={"Authorization": f"Bearer {self.auth_token}"},
+                timeout=self.timeout_sec,
+            )
+        except requests.RequestException:
+            return SendResult(ok=False, reason="ağ hatası")
+        if resp.status_code == 200:
+            return SendResult(ok=True)
+        return SendResult(
+            ok=False,
+            permanent=resp.status_code in PERMANENT_REJECT_STATUSES,
+            reason=f"HTTP {resp.status_code}",
+        )
+
+    def close(self) -> None:  # HTTP bağlantı havuzu requests'e ait; kapatılacak durum yok
+        pass
+
+
+def _require_paho():
+    try:
+        import paho.mqtt.client as mqtt_client
+    except ImportError as exc:
+        raise ImportError(_MQTT_HINT) from exc
+    return mqtt_client
+
+
+class MqttTransport:
+    """Aynı JSON batch'i ``t/{tenant}/{store}/{device}/events`` konusuna yayınlar.
+
+    MQTT'de "kalıcı red" kavramı yoktur: her hata geçicidir, olaylar spool'da
+    bekler (at-least-once; idempotens backend'de event_id ile).
+    """
+
+    def __init__(self, config: EdgeConfig, *, timeout_sec: float = 5.0) -> None:
+        mqtt_client = _require_paho()
+        mp = config.publisher.mqtt
+        self.host = mp.host
+        self.port = mp.port
+        self.qos = mp.qos
+        self.timeout_sec = timeout_sec
+        self.topic = f"t/{config.tenant_id}/{config.store_id}/{config.device_id}/events"
+        try:  # paho >= 2.0 callback API sürümü ister; 1.x istemez
+            self._client = mqtt_client.Client(mqtt_client.CallbackAPIVersion.VERSION2)
+        except AttributeError:
+            self._client = mqtt_client.Client()
+        self._connected = False
+
+    def send(self, wires: list[dict[str, Any]]) -> SendResult:
+        payload = json.dumps({"events": wires}, ensure_ascii=False)
+        try:
+            if not self._connected:
+                self._client.connect(self.host, self.port, keepalive=60)
+                self._client.loop_start()
+                self._connected = True
+            info = self._client.publish(self.topic, payload, qos=self.qos)
+            info.wait_for_publish(timeout=self.timeout_sec)
+            if info.is_published():
+                return SendResult(ok=True)
+            return SendResult(ok=False, reason="mqtt yayın teyidi alınamadı")
+        except Exception as exc:  # bağlantı kopması vb.: geçici, tekrar denenir
+            self._connected = False
+            return SendResult(ok=False, reason=f"mqtt hatası: {exc}")
+
+    def close(self) -> None:
+        try:
+            self._client.loop_stop()
+            self._client.disconnect()
+        except Exception:
+            pass
+
+
+def make_transport(config: EdgeConfig, *, timeout_sec: float = 5.0) -> Transport:
+    """Config'e göre taşıma kurar; bilinmeyen değer ConfigError'da yakalanır."""
+    kind = config.publisher.transport
+    if kind == "mqtt":
+        return MqttTransport(config, timeout_sec=timeout_sec)
+    if kind == "http":
+        return HttpTransport(config, timeout_sec=timeout_sec)
+    raise ValueError(f"bilinmeyen publisher.transport: '{kind}' (izinli: http, mqtt)")
 
 
 class SpoolStore:
@@ -132,10 +258,12 @@ class Publisher:
         *,
         spool_path: Optional[str | Path] = None,
         timeout_sec: float = 5.0,
+        transport: Optional[Transport] = None,
     ) -> None:
         self.cfg = config
         self.timeout_sec = timeout_sec
         self.url = config.backend_url.rstrip("/") + INGEST_PATH
+        self.transport: Transport = transport or make_transport(config, timeout_sec=timeout_sec)
         self.batch_size = min(MAX_BATCH, max(1, config.publisher.batch_size))
         self.store = SpoolStore(
             spool_path or config.publisher.spool_path,
@@ -161,24 +289,12 @@ class Publisher:
         self.unflushed += 1
         return wire
 
-    def _post(self, wires: list[dict[str, Any]]) -> Optional[int]:
-        """HTTP durum kodunu döndürür; ağ hatasında None (geçici, tekrar denenir)."""
-        try:
-            resp = requests.post(
-                self.url,
-                json={"events": wires},
-                headers={"Authorization": f"Bearer {self.cfg.auth_token}"},
-                timeout=self.timeout_sec,
-            )
-            return resp.status_code
-        except requests.RequestException:
-            return None
-
     def flush(self) -> dict[str, int]:
-        """Spool'u seq sırasıyla gönderir; 200'de siler, kalıcı 4xx'te düşürür.
+        """Spool'u seq sırasıyla gönderir; başarıda siler, kalıcı redde düşürür.
 
-        Geçici hatada (ağ / 5xx / auth) olaylar spool'da kalır ve bir sonraki
-        flush'ta yeniden denenir (at-least-once).
+        Geçici hatada (ağ / 5xx / auth / mqtt kopması) olaylar spool'da kalır
+        ve bir sonraki flush'ta yeniden denenir (at-least-once) — davranış
+        taşımadan (http/mqtt) bağımsızdır.
         """
         sent = 0
         dropped = 0
@@ -187,30 +303,29 @@ class Publisher:
             if not batch:
                 break
             seqs = [s for s, _ in batch]
-            status = self._post([w for _, w in batch])
-            if status == 200:
+            result = self.transport.send([w for _, w in batch])
+            if result.ok:
                 self.store.delete(seqs)
                 sent += len(batch)
-            elif status in PERMANENT_REJECT_STATUSES:
+            elif result.permanent:
                 # Yeniden deneme bu batch'i asla geçiremez: düşür ve devam et.
                 self.store.delete(seqs)
                 dropped += len(batch)
                 print(
-                    f"uyarı: backend {status} (kalıcı red) döndü; {len(batch)} olay "
+                    f"uyarı: backend {result.reason} (kalıcı red) döndü; {len(batch)} olay "
                     f"(seq {seqs[0]}-{seqs[-1]}) spool'dan düşürüldü",
                     file=sys.stderr,
                 )
             else:
                 # Geçici hata: spool'da beklet, sonraki flush'ta dene. Aynı hata
                 # üst üste tekrar ederse yalnız ilkinde uyar (stderr spam'i yok).
-                reason = "ağ hatası" if status is None else f"HTTP {status}"
-                if reason != self._last_transient:
+                if result.reason != self._last_transient:
                     print(
-                        f"uyarı: ingest gönderimi başarısız ({reason}); "
+                        f"uyarı: ingest gönderimi başarısız ({result.reason}); "
                         f"{self.store.count()} olay spool'da bekliyor, yeniden denenecek",
                         file=sys.stderr,
                     )
-                    self._last_transient = reason
+                    self._last_transient = result.reason
                 break
         if sent:
             self._last_transient = None
@@ -218,5 +333,6 @@ class Publisher:
         return {"sent": sent, "dropped": dropped, "pending_spool": self.store.count()}
 
     def close(self) -> None:
-        """Spool bağlantısını kapatır (olaylar publish() anında zaten diskte)."""
+        """Taşımayı ve spool bağlantısını kapatır (olaylar publish() anında zaten diskte)."""
+        self.transport.close()
         self.store.close()
