@@ -1,8 +1,19 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
+import pytest
+
+from wherugo_backend import metrics
+from wherugo_backend.models import CoverageGap
 from wherugo_backend.quality import badge_from_gap, k_suppress
 
 from helpers import AUTH, ingest, track_update, utcnow, window
+
+
+@pytest.fixture()
+def db(client):
+    session = client.app.state.sessionmaker()
+    yield session
+    session.close()
 
 
 def test_badge_rules_pure():
@@ -56,3 +67,17 @@ def test_endpoint_badge_red_on_large_gap(client):
     resp = client.get("/v1/stores/1/metrics", headers=AUTH,
                       params={"metric": "occupancy", **window(t0, t0 + timedelta(hours=1))})
     assert resp.json()["quality_badge"] == "red"
+
+
+def test_coverage_gaps_total_clipped_to_window(db):
+    # 5-day gap intersecting a 1h query window: only the overlap counts
+    db.add(CoverageGap(store_id=1, device_id="edge-1a",
+                       gap_start=datetime(2026, 7, 1, 0, 0),
+                       gap_end=datetime(2026, 7, 6, 0, 0), reason="seq_gap"))
+    db.commit()
+    res = metrics.coverage_gaps(db, 1, datetime(2026, 7, 5, 23, 0), datetime(2026, 7, 6, 0, 0))
+    assert res["total_minutes"] == 60.0  # not 7200
+    assert res["gaps"][0]["duration_sec"] == 3600.0
+    # raw gap bounds stay unclipped in the listing
+    assert res["gaps"][0]["gap_start"] == "2026-07-01T00:00:00Z"
+    assert res["gaps"][0]["gap_end"] == "2026-07-06T00:00:00Z"

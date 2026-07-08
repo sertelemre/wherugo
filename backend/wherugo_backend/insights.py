@@ -87,7 +87,8 @@ def build_metrics_bundle(session: Session, store_id: int,
         if z.zone_type == "entrance":
             continue
         d = metrics.dwell_stats(session, store_id, z.id, t_from, t_to)
-        if d["visits"] > 0:
+        # k<10 suppressed zones must not leak into the AI briefing either.
+        if d["visits"] > 0 and not d.get("suppressed"):
             zones_out.append({
                 "name": z.name, "zone_type": z.zone_type,
                 "visits": d["visits"],

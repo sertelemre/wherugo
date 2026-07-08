@@ -94,7 +94,16 @@ class Simulator:
             now = now.replace(tzinfo=timezone.utc)
         self.now = now.replace(microsecond=0)
         self.agents: list[_Agent] = []
-        self._next_track = 1001
+        # track_id tabanı çalıştırma başına benzersiz: başlangıç zamanının epoch
+        # saniyesinden türetilir (restart/çok koşu sonrası aynı gün içinde farklı
+        # müşteriler aynı track_id'de birleşmesin — CONTRACTS §0 "track_id
+        # oturum-yerel"). Determinizm korunur: aynı seed + aynı start_time →
+        # aynı taban → birebir aynı olaylar. start_time verilmemişse taban
+        # "şimdi"den türer, yani her çalıştırma farklı taban alır.
+        # Çarpan 2000 tabanı int32 sınırında tutar (PostgreSQL Integer kolonu):
+        # maks (10^6 - 1) * 2000 + ajan sayısı < 2^31 - 1.
+        self._track_base = (int(self.now.timestamp()) % 1_000_000) * 2000
+        self._next_track = self._track_base + 1
         self._camera_id = config.cameras[0].id
 
         zones = config.zones
@@ -377,7 +386,12 @@ def run_simulation(
     duration_sec: float = 3600.0,
     start_time: Optional[datetime] = None,
 ) -> Iterator[tuple[datetime, list[Event]]]:
-    """Simülatör + zone motorunu bağlar; her sim-adımda olay listesi üretir."""
+    """Simülatör + zone motorunu bağlar; her sim-adımda olay listesi üretir.
+
+    track_id tabanı start_time'dan türetilir (çalıştırma başına benzersiz);
+    start_time verilmezse "şimdi" kullanılır — determinizm için aynı seed'e
+    ek olarak aynı start_time da verilmelidir.
+    """
     sim = Simulator(config, seed=seed, start_time=start_time)
     ep = config.engine
     engine = ZoneEngine(

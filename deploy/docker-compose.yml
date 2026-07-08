@@ -11,7 +11,8 @@ services:
     volumes:
       - wherugo-data:/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/v1/stores', timeout=3)"]
+      # /healthz auth istemez; /v1/* uçları Bearer token ister ve 401 döner.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)"]
       interval: 5s
       timeout: 5s
       retries: 12

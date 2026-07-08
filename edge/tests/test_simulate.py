@@ -9,13 +9,14 @@ from wherugo_edge.sources.simulate import run_simulation
 
 DEMO_YAML = Path(__file__).resolve().parents[2] / "deploy" / "edge-demo.yaml"
 START = datetime(2026, 7, 7, 12, 0, 0, tzinfo=timezone.utc)
+START2 = datetime(2026, 7, 6, 9, 30, 0, tzinfo=timezone.utc)
 
 
-def collect(seed, duration=300):
+def collect(seed, duration=300, start=START):
     cfg = load_config(DEMO_YAML)
     enveloper = Enveloper(cfg.tenant_id, cfg.store_id, cfg.device_id, rng=random.Random(seed))
     wires = []
-    for _, events in run_simulation(cfg, seed=seed, duration_sec=duration, start_time=START):
+    for _, events in run_simulation(cfg, seed=seed, duration_sec=duration, start_time=start):
         for ev in events:
             wires.append(enveloper.wrap(ev))
     return wires
@@ -32,6 +33,30 @@ def test_different_seed_differs():
     a = collect(seed=42, duration=120)
     b = collect(seed=43, duration=120)
     assert a != b
+
+
+def test_track_id_base_unique_per_start():
+    """Farklı start → farklı track_id tabanı: restart sonrası müşteriler birleşmez."""
+    a = collect(seed=42, duration=180)
+    b = collect(seed=42, duration=180, start=START2)
+    tids_a = {w["track_id"] for w in a if w["type"] == "track_update"}
+    tids_b = {w["track_id"] for w in b if w["type"] == "track_update"}
+    assert tids_a and tids_b
+    assert tids_a.isdisjoint(tids_b)
+
+    # taban start'ın epoch saniyesinden türer ve int32 sınırında kalır
+    base = (int(START.timestamp()) % 1_000_000) * 2000
+    assert all(base < t <= base + 2000 for t in tids_a)
+    assert max(tids_a) < 2**31 - 1
+
+
+def test_track_ids_deterministic_for_same_seed_and_start():
+    """Aynı seed + aynı start → aynı track_id'ler (determinizm korunur)."""
+    a = collect(seed=42, duration=180)
+    b = collect(seed=42, duration=180)
+    tids_a = [w["track_id"] for w in a if w["type"] == "track_update"]
+    tids_b = [w["track_id"] for w in b if w["type"] == "track_update"]
+    assert tids_a == tids_b
 
 
 def test_event_mix_is_sane():

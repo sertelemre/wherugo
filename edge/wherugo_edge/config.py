@@ -74,6 +74,8 @@ class PublisherParams:
     spool_path: str = "wherugo-edge-spool.sqlite"
     batch_size: int = 200
     flush_interval_sec: float = 2.0
+    # Spool'daki en fazla kayıt; aşılırsa en eskiler silinir (0 = sınırsız).
+    spool_max_events: int = 200_000
 
 
 @dataclass
@@ -229,7 +231,10 @@ def config_from_dict(data: dict) -> EdgeConfig:
         spool_path=str(pub_raw.get("spool_path", "wherugo-edge-spool.sqlite")),
         batch_size=min(500, int(pub_raw.get("batch_size", 200))),
         flush_interval_sec=float(pub_raw.get("flush_interval_sec", 2.0)),
+        spool_max_events=int(pub_raw.get("spool_max_events", 200_000)),
     )
+    if cfg.publisher.spool_max_events < 0:
+        raise ConfigError("publisher.spool_max_events negatif olamaz (0 = sınırsız)")
     return cfg
 
 
