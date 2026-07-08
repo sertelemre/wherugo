@@ -140,3 +140,79 @@ docker compose -f deploy/docker-compose.yml up  # aynı demoyu 2 konteynerde
 ```
 
 Python ≥3.10, her paket kendi `pyproject.toml`'u ile `pip install -e` kurulabilir; kök `Makefile` üçünü kurar.
+
+---
+
+# v2 Eklentileri — Tam Ürün Sözleşmeleri
+
+## 9. Kimlik Doğrulama (auth v2)
+
+- `WHERUGO_AUTH_MODE=demo|jwt` (varsayılan **demo**: `Bearer demo` → t_demo, mevcut davranış).
+- **jwt modu:** HS256 (stdlib hmac — ek bağımlılık yok), secret `WHERUGO_JWT_SECRET`, claim'ler `{"tenant": str, "exp": int}`.
+- `POST /v1/auth/token` gövde `{"api_key": "..."}` → `{"token": "...", "expires_in": 86400}`. `tenant.api_key_hash`
+  (sha256) ile eşleşir; demo seed t_demo için `WHERUGO_DEMO_API_KEY` (vars. `demo-api-key`) hash'ler.
+- 401 gövdesi `{"detail": "..."}`; dashboard 401 görünce token giriş ekranı gösterir (localStorage'da saklar).
+
+## 10. Yönetim API'si (onboarding kod gerektirmez)
+
+| Uç | Gövde/Dönüş |
+|---|---|
+| `POST /v1/stores` | `{name, plan_width_m, plan_height_m, timezone}` → store (tenant auth'tan) |
+| `PUT /v1/stores/{id}` | kısmi güncelleme |
+| `POST /v1/stores/{id}/zones` | `{name, zone_type, polygon, category?}` → zone (id server verir) |
+| `PUT /v1/stores/{id}/zones/{zid}` · `DELETE ...` | güncelle / sil (silinen zone'un geçmiş verisi kalır) |
+| `POST /v1/stores/{id}/devices` | `{id, name}` → edge_device |
+| `GET /v1/stores/{id}/devices` | cihaz listesi + sağlık özeti |
+
+Not: Zone değişikliği MVP'de kenara OTOMATİK yansımaz (kenar YAML okur); üretim yolu imzalı config push'tur (docs/06 §6.6). Bu kısıt API açıklamasında belirtilir.
+
+## 11. Alarmlar ve Webhook
+
+- Tablo `alert(id, store_id, zone_id, type, ts, payload_json, delivered_bool)`; `type ∈ {queue_length, queue_wait}`.
+- Kuyruk ölçümü alert eşiğini AŞAĞIDAN YUKARI geçtiğinde (kenar durumundan bağımsız, backend ingest'te tespit)
+  bir alert kaydı açılır; `store.webhook_url` doluysa `POST {type, store_id, zone_id, ts, queue_len, est_wait_sec}`
+  arka planda denenir (timeout 5 sn, başarısızlık alert'i silmez, delivered=false kalır). Histerezis: aynı zone'da
+  eşik altına inmeden ikinci alert açılmaz.
+- `GET /v1/stores/{id}/alerts?from&to` → liste. `PUT /v1/stores/{id}` webhook_url alanını kabul eder.
+
+## 12. Export
+
+- `GET /v1/stores/{id}/export/rollup?from&to&format=csv` → **saatlik zone rollup** CSV
+  (`hour, zone_id, zone_name, visits, unique_visitors, dwell_p50, dwell_p95, queue_max, queue_abandons`).
+  k<10 satırlar bastırılır (unique_visitors<10 → dwell alanları boş). Ham track verisi ASLA export edilmez.
+
+## 13. MQTT Taşıma (üretim yolu)
+
+- Edge config: `publisher.transport: http|mqtt` (vars http). mqtt ayarları: `{host, port: 1883, qos: 1}`;
+  topic `t/{tenant_id}/{store_id}/{device_id}/events`; payload mevcut JSON batch `{"events": [...]}`.
+  paho-mqtt `edge[mqtt]` extra'sı; spool/at-least-once davranışı taşımadan bağımsız aynı.
+- Backend köprüsü: `python -m wherugo_backend.mqtt_bridge` — `t/+/+/+/events` abone olur, process_batch'e verir
+  (idempotens aynı). Env: `WHERUGO_MQTT_HOST/PORT`. `backend[mqtt]` extra'sı.
+- compose `--profile mqtt`: eclipse-mosquitto servisi + bridge + edge'in mqtt transport'u.
+
+## 14. Günlük Otomatik Brifing
+
+- Backend lifespan'da asyncio görevi: her gün `WHERUGO_BRIEFING_HOUR` (vars. 07, store yerel saati) geçildiğinde
+  önceki günün brifingini olmayan mağazalar için üretir. `WHERUGO_BRIEFING_AUTO=0` kapatır. Test için fonksiyon
+  saf çağrılabilir: `generate_due_briefings(session_factory, now)`.
+
+## 15. VLM İstemcisi (MiMo-VL gerçek yol)
+
+- `ai/wherugo_ai/vlm.py`: `OpenAICompatVLM(base_url, model, api_key=None)` — OpenAI-uyumlu vision chat
+  (`image_url` data: base64 jpeg kareleri, en fazla 8 kare) → `VLMVerdict(label, conf, rationale)`;
+  yanıt JSON parse korkuluklu. Env fabrika: `get_vlm()` (`WHERUGO_VLM_BASE_URL/MODEL/API_KEY`; yoksa MockVLM).
+- Edge video modunda interaction anında son 10 sn'den 8 jpeg karesi `clips/<tarih>/evt-<seq>/` altına yazılır
+  (yalnız YEREL disk; 72 saat TTL temizliği edge'de). VLM çağrısı `WHERUGO_VLM_BASE_URL` doluysa kenardan yapılır,
+  verdict olayla birlikte gönderilir (`interaction_detected.vlm_verdict/vlm_conf` alanları — backend zaten saklıyor).
+- Simülatör klip üretmez (piksel yok); bu yol yalnız video kaynağında.
+
+## 16. Video Kaynağı (GPU'suz test edilebilir)
+
+- `edge[cv]` extra: `opencv-python-headless` (torch DEĞİL). Dedektör soyutlaması: `detector: yolo|mock`.
+  `yolo` ultralytics ister (`edge[yolo]` extra, sahada). `mock` dedektör: arka plan çıkarımı + kontur (saf OpenCV)
+  — sentetik/test videolarında kişi-vari blob'ları tespit eder; birim testleri sentetik hareketli kare üretip
+  video yolunu uçtan uca (frame→track→zone olayı) GPU'suz doğrular.
+
+## 17. CI
+
+- `.github/workflows/ci.yml`: push/PR'da 3 paketin pytest'i + `node --input-type=module --check` dashboard kontrolü.
