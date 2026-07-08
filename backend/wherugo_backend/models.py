@@ -16,6 +16,8 @@ class Tenant(Base):
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     isolation_tier: Mapped[str] = mapped_column(String(32), default="shared")
+    # v2 (CONTRACTS section 9): sha256 hex of the tenant API key; never the key itself.
+    api_key_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
 
 class Store(Base):
@@ -27,6 +29,8 @@ class Store(Base):
     plan_width_m: Mapped[float] = mapped_column(Float)
     plan_height_m: Mapped[float] = mapped_column(Float)
     timezone: Mapped[str] = mapped_column(String(64), default="Europe/Istanbul")
+    # v2 (CONTRACTS section 11): queue alerts are POSTed here when set.
+    webhook_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
 
     zones: Mapped[list["Zone"]] = relationship(back_populates="store")
 
@@ -145,6 +149,20 @@ class PosDaily(Base):
     date: Mapped[date] = mapped_column(Date, primary_key=True)
     transactions: Mapped[int] = mapped_column(Integer, default=0)
     revenue: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class Alert(Base):
+    """Queue alert (CONTRACTS section 11). DB column for the delivery flag is
+    named `delivered_bool` per the contract; the Python attribute is `delivered`."""
+    __tablename__ = "alert"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    store_id: Mapped[int] = mapped_column(Integer, index=True)
+    zone_id: Mapped[int] = mapped_column(Integer, index=True)
+    type: Mapped[str] = mapped_column(String(32))  # queue_length | queue_wait
+    ts: Mapped[datetime] = mapped_column(DateTime, index=True)
+    payload_json: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    delivered: Mapped[bool] = mapped_column("delivered_bool", Boolean, default=False)
 
 
 class Briefing(Base):

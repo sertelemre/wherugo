@@ -5,6 +5,9 @@ COPY ai/ ./ai/
 COPY backend/ ./backend/
 COPY dashboard/ ./dashboard/
 RUN pip install --no-cache-dir -e ./ai -e ./backend
+# Opsiyonel taşıma/DB sürücüleri: mqtt köprüsü (--profile mqtt) ve
+# PostgreSQL (--profile postgres, WHERUGO_DB_URL=postgresql+psycopg://...).
+RUN pip install --no-cache-dir 'paho-mqtt>=2' 'psycopg[binary]>=3'
 
 EXPOSE 8000
 ENV WHERUGO_DB_URL=sqlite:////data/wherugo.db

@@ -18,7 +18,7 @@ Guarantees (CONTRACTS section 2):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from . import alerts
 from .models import CoverageGap, EdgeDevice, EventRaw, QueueSample, Store, TrackPosition, ZoneVisit
 from .util import parse_ts, utcnow
 
@@ -47,6 +48,10 @@ class IngestResult:
     duplicates: int = 0
     rejected: int = 0
     gap_detected: bool = False
+    # Webhook jobs for alerts opened by this batch (CONTRACTS section 11).
+    # The caller (ingest endpoint) schedules delivery in the background AFTER
+    # the batch commit; entries with url=None are informational only.
+    webhook_jobs: list[dict[str, Any]] = field(default_factory=list)
 
 
 def normalize_event(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -85,7 +90,9 @@ def _resolve_is_staff(session: Session, store_id: int, track_id: int | None, ev:
     return bool(val) if val is not None else False
 
 
-def _project(session: Session, ev: dict[str, Any]) -> None:
+def _project(session: Session, ev: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one event into its typed table. Returns a webhook job dict when
+    a queue_measurement opened a new alert (see alerts.maybe_open_alert)."""
     etype = ev["type"]
     store_id = ev["store_id"]
     ts: datetime = ev["event_time"]

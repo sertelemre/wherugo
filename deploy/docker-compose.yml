@@ -1,11 +1,38 @@
 # WherUGo demo: backend (dashboard dahil) + sentetik edge simülatörü
 # Çalıştırma: docker compose -f deploy/docker-compose.yml up --build
 # Dashboard:  http://localhost:8000
+#
+# Profiller (CONTRACTS §13):
+#   --profile mqtt      mosquitto + mqtt köprüsü + mqtt taşımalı edge simülatörü
+#   --profile postgres  postgres:16 (SQLite yerine; WHERUGO_DB_URL notlarına bak)
+#
+# DB SEÇİMİ (README-vari not — compose'da profil-koşullu env yoktur, URL dışarıdan verilir):
+#
+#   1) SQLite (varsayılan; tek yazar, demo için yeterli):
+#        docker compose -f deploy/docker-compose.yml up --build
+#        # eşdeğer env bloğu:
+#        #   WHERUGO_DB_URL: sqlite:////data/wherugo.db
+#
+#   2) PostgreSQL (--profile postgres; mqtt profiliyle birlikte ÖNERİLİR, aşağıya bak):
+#        WHERUGO_DB_URL='postgresql+psycopg://wherugo:wherugo@postgres:5432/wherugo' \
+#        docker compose -f deploy/docker-compose.yml --profile postgres up --build
+#        # eşdeğer env bloğu:
+#        #   WHERUGO_DB_URL: postgresql+psycopg://wherugo:wherugo@postgres:5432/wherugo
+#
+# MQTT + POSTGRES birlikte (üretim yoluna en yakın demo):
+#        WHERUGO_DB_URL='postgresql+psycopg://wherugo:wherugo@postgres:5432/wherugo' \
+#        docker compose -f deploy/docker-compose.yml --profile mqtt --profile postgres up --build
+#        # Not: mqtt profili aktifken varsayılan HTTP edge-simulator da çalışmaya devam
+#        # eder (aynı device_id ile seq_no çakışması/seq_reset üretir). Yalnız MQTT
+#        # yolunu izlemek için HTTP simülatörünü kapatın:
+#        #   ... --profile mqtt up --scale edge-simulator=0
 services:
   backend:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.backend
+    # Sabit imaj adı: mqtt-bridge aynı imajı yeniden build etmeden kullanır.
+    image: wherugo-backend:local
     ports:
       - "8000:8000"
     volumes:
@@ -17,6 +44,9 @@ services:
       timeout: 5s
       retries: 12
     environment:
+      # DB: yukarıdaki "DB SEÇİMİ" notuna bak (SQLite vars.; postgres profiliyle
+      # WHERUGO_DB_URL=postgresql+psycopg://wherugo:wherugo@postgres:5432/wherugo).
+      WHERUGO_DB_URL: ${WHERUGO_DB_URL:-sqlite:////data/wherugo.db}
       # AI sağlayıcısı: mock (anahtarsız) | openai (MiMo/vLLM: WHERUGO_LLM_BASE_URL) | anthropic
       WHERUGO_LLM_PROVIDER: ${WHERUGO_LLM_PROVIDER:-mock}
       WHERUGO_LLM_BASE_URL: ${WHERUGO_LLM_BASE_URL:-}
@@ -37,5 +67,82 @@ services:
       --speed 20 --duration 43200 --seed 42
       --backend-url http://backend:8000
 
+  # ---------------------------------------------------------------- mqtt ---
+  # CONTRACTS §13 üretim taşıma yolu: edge -> mosquitto -> mqtt-bridge -> DB.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    profiles: ["mqtt"]
+    ports:
+      - "1883:1883" # host'tan debug (mosquitto_sub -t 't/#') için; içerde şart değil
+    volumes:
+      # Demo config: anonim erişim. ÜRETİMDE mTLS + tenant ACL — mosquitto.conf notuna bak.
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  mqtt-bridge:
+    # backend ile aynı imaj (backend servisi build eder ve wherugo-backend:local tag'ler).
+    image: wherugo-backend:local
+    profiles: ["mqtt"]
+    command: python -m wherugo_backend.mqtt_bridge
+    depends_on:
+      mosquitto:
+        condition: service_started
+      backend:
+        condition: service_healthy # tablolar + demo seed (t_demo/store 1) hazır olsun
+    environment:
+      WHERUGO_MQTT_HOST: mosquitto
+      WHERUGO_MQTT_PORT: "1883"
+      WHERUGO_DB_URL: ${WHERUGO_DB_URL:-sqlite:////data/wherugo.db}
+    volumes:
+      # Backend'in DB volume'u paylaşılır (SQLite'ta aynı dosyaya yazmak için).
+      # ÖNEMLİ — SQLite ÇOKLU YAZAR SORUNU: SQLite tek-yazar kilidiyle çalışır;
+      # backend (HTTP ingest) + köprü aynı dosyaya yazınca yük altında
+      # "database is locked" hataları görülebilir. mqtt profili bu yüzden
+      # postgres profiliyle BİRLİKTE önerilir (dosya başındaki komut örneği).
+      - wherugo-data:/data
+
+  # mqtt taşımalı edge simülatörü varyantı. CONTRACTS §13 kenar şeması:
+  #   publisher.transport: http|mqtt  +  mqtt: {host, port: 1883, qos: 1}
+  # wherugo-edge CLI'da (bu yazım anında) --transport bayrağı yok; override bu
+  # yüzden environment ile yapılır. Kenar mqtt implementasyonu bayrak eklerse
+  # command'a "--transport mqtt" taşınabilir.
+  edge-simulator-mqtt:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.edge
+    profiles: ["mqtt"]
+    depends_on:
+      mosquitto:
+        condition: service_started
+      backend:
+        condition: service_healthy
+    environment:
+      WHERUGO_TRANSPORT: mqtt # = config publisher.transport: mqtt (§13)
+      WHERUGO_MQTT_HOST: mosquitto
+      WHERUGO_MQTT_PORT: "1883"
+      WHERUGO_MQTT_QOS: "1"
+      WHERUGO_BACKEND_URL: http://backend:8000 # http'ye geri düşüş/karşılaştırma için
+    command: >
+      wherugo-edge --config deploy/edge-demo.yaml --source simulate
+      --speed 20 --duration 43200 --seed 42
+
+  # ------------------------------------------------------------ postgres ---
+  postgres:
+    image: postgres:16
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: wherugo
+      POSTGRES_PASSWORD: wherugo # demo; üretimde secret yönetimi
+      POSTGRES_DB: wherugo
+    volumes:
+      - wherugo-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wherugo -d wherugo"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    # Kullanım: backend/köprüye WHERUGO_DB_URL dışarıdan verilir (dosya başındaki
+    # "DB SEÇİMİ" notu). psycopg sürücüsü Dockerfile.backend'de kuruludur.
+
 volumes:
   wherugo-data:
+  wherugo-pg:

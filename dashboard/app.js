@@ -1,9 +1,14 @@
 // WherUGo dashboard — ana uygulama (statik SPA, build adımı yok).
-// Sekmeler: Genel Bakış · Isı Haritası · Bölgeler · Kuyruk · Brifing (CONTRACTS §7).
+// Sekmeler: Genel Bakış · Isı Haritası · Bölgeler · Kuyruk · Brifing · Yönetim
+// (CONTRACTS §7 + v2 §9 auth, §10 yönetim, §11 alarmlar).
 // Backend yokken sayfa çökmez: her panel kendi "backend bekleniyor" durumunu gösterir
-// ve mağaza bilgisi 15 sn'de bir yeniden denenir.
+// ve mağaza bilgisi 15 sn'de bir yeniden denenir. v2 uçları olmayan eski backend'de
+// (404/405) yeni paneller "backend bu özelliği henüz desteklemiyor" durumuna düşer.
 
-import { apiGet, apiPost, ApiError, qs } from './api.js';
+import {
+  apiGet, apiPost, apiPut, apiDelete, ApiError, qs,
+  requestToken, setToken, clearToken, hasStoredToken, onUnauthorized,
+} from './api.js';
 import {
   escapeHtml, mdToHtml, fmtInt, fmtNum1, fmtPct, fmtDur,
   parseTs, fmtHour, fmtClock, fmtDay, localDateStr,
@@ -20,6 +25,8 @@ const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const CELL_M = 0.5; // ısı haritası hücre kenarı (metre)
 const QUEUE_POLL_MS = 15000;
 const BOOT_RETRY_MS = 15000;
+// Heartbeat ~30 sn periyotludur; 2 dakikadan taze heartbeat = çevrimiçi kabulü.
+const DEVICE_ONLINE_MS = 120000;
 
 const state = {
   storeId: 1,
@@ -90,6 +97,32 @@ function showError(el, err) {
   if (!el) return;
   el.innerHTML = `<div class="state-msg state-msg--err">${escapeHtml(friendly(err))}` +
     '<br><button type="button" class="btn btn--sm" data-retry>Yeniden dene</button></div>';
+}
+
+/**
+ * v2 ucu eski backend'de yok: FastAPI bilinmeyen yola 404, yalnız GET tanımlı
+ * yola PUT/DELETE için 405 döner. Bu durumları "hata" değil "özellik henüz yok"
+ * olarak gösteririz — backend başka ajan tarafından eşzamanlı geliştiriliyor.
+ */
+function isV2Missing(err) {
+  return err instanceof ApiError && [404, 405, 501].includes(err.status);
+}
+
+/** v2 ucu yoksa bilgilendirici durum, aksi halde normal hata gösterimi. */
+function showV2State(el, err, endpointNote) {
+  if (isV2Missing(err)) {
+    showState(el, `Backend bu özelliği henüz desteklemiyor — ${endpointNote} ucu bekleniyor (v2).`);
+  } else {
+    showError(el, err);
+  }
+}
+
+/** Form yanı durum mesajı ('' | 'ok' | 'err'). */
+function setFormMsg(el, text, kind = '') {
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'form-msg' +
+    (kind === 'ok' ? ' form-msg--ok' : kind === 'err' ? ' form-msg--err' : '');
 }
 
 /**
@@ -175,10 +208,13 @@ function normalizeStore(d) {
     name: s.name ?? 'Mağaza',
     planW: Number(s.plan_width_m) > 0 ? Number(s.plan_width_m) : 20,
     planH: Number(s.plan_height_m) > 0 ? Number(s.plan_height_m) : 12,
+    timezone: typeof s.timezone === 'string' ? s.timezone : '',
+    webhookUrl: typeof s.webhook_url === 'string' ? s.webhook_url : '',
     zones: (Array.isArray(zonesRaw) ? zonesRaw : []).map((z) => ({
       id: z.id,
       name: z.name ?? `Bölge ${z.id}`,
       type: String(z.zone_type ?? z.type ?? 'other'),
+      category: z.category == null ? '' : String(z.category),
       poly: parsePolygon(z),
     })),
   };
@@ -189,6 +225,19 @@ async function ensureStore() {
   const detail = await apiGet(`/v1/stores/${state.storeId}`);
   state.store = normalizeStore(detail);
   return state.store;
+}
+
+/**
+ * Mağaza detayını zorla yeniden çeker (yönetim mutasyonlarından sonra):
+ * ısı haritası ve diğer sekmeler yeni/silinen bölgeleri hemen görür (§10).
+ */
+async function refreshStore() {
+  state.store = null;
+  const store = await ensureStore();
+  state.storeName = store.name;
+  const nameEl = $('#store-name');
+  if (nameEl) nameEl.textContent = store.name;
+  return store;
 }
 
 function zoneNameById(id) {
