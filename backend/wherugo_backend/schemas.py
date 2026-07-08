@@ -21,6 +21,9 @@ class IngestResponse(BaseModel):
     accepted: int
     duplicates: int
     gap_detected: bool
+    # Events dropped individually (malformed envelope/fields, foreign-tenant
+    # store, out-of-range dwell). Additive to the CONTRACTS section 2 trio.
+    rejected: int = 0
 
 
 # --- quality ----------------------------------------------------------------
@@ -66,7 +69,9 @@ class MetricsResponse(BaseModel):
     metric: str
     granularity: str
     series: list[SeriesPoint]
-    total: float
+    # None when the metric cannot be rated for the window (e.g. conversion
+    # over a window with no fully covered store-local day).
+    total: Optional[float] = None
     quality_badge: str
     quality_detail: QualityDetail
 
@@ -77,6 +82,8 @@ class DwellResponse(BaseModel):
     stats: dict[str, Optional[float]]
     visits: int
     draw_rate: Optional[float]
+    # True when stats/draw_rate were hidden by k<10 anonymity suppression.
+    suppressed: bool = False
     quality_badge: str
     quality_detail: QualityDetail
 
@@ -174,6 +181,9 @@ class FunnelResponse(BaseModel):
 
 class PosImportResponse(BaseModel):
     imported: int
+    # Number of unparseable CSV rows that were skipped; omitted (None) when 0
+    # so the historical {"imported": n} shape is preserved.
+    skipped: Optional[int] = None
 
 
 # --- ai ---------------------------------------------------------------------

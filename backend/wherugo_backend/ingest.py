@@ -1,8 +1,17 @@
 """Ingest pipeline: batch events -> event_raw + typed projections.
 
 Guarantees (CONTRACTS section 2):
-- at-least-once friendly: duplicate event_id is silently counted, 200 returned
-- per-device seq_no gap detection -> coverage_gap(reason='seq_gap')
+- at-least-once friendly: duplicate event_id is silently counted, 200 returned;
+  concurrent retries of the same batch are absorbed by retrying on
+  IntegrityError instead of surfacing a 500
+- per-device seq_no gap detection -> coverage_gap(reason='seq_gap'); a seq_no
+  that FALLS BELOW the device's high-water mark is treated as a device/counter
+  reset -> coverage_gap(reason='seq_reset') and gap tracking resumes from the
+  new base
+- tenant isolation: an event is only projected when its store_id belongs to
+  the authenticated tenant; event_raw.tenant_id always comes from auth
+- a malformed event is rejected individually (counted in `rejected`) and never
+  drops the rest of the batch
 - projections: track_update -> track_position, zone_enter/zone_exit -> zone_visit
   (enter opens an open visit, exit closes it; a lone exit still records a visit),
   queue_measurement -> queue_sample, interaction_detected -> event_raw only.
@@ -13,20 +22,30 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from .models import CoverageGap, EdgeDevice, EventRaw, QueueSample, TrackPosition, ZoneVisit
+from .models import CoverageGap, EdgeDevice, EventRaw, QueueSample, Store, TrackPosition, ZoneVisit
 from .util import parse_ts, utcnow
 
 ENVELOPE_FIELDS = ("tenant_id", "store_id", "device_id", "schema_version",
                    "seq_no", "event_id", "event_time", "ingest_time")
+
+# dwell_sec sanity bounds: negative or >24h values are sensor garbage and are
+# rejected (they would poison p50/p95 and create future-dated enter_ts rows).
+MAX_DWELL_SEC = 86400.0
+
+# Exceptions a single malformed event may raise inside _project / EventRaw
+# construction; anything else (IntegrityError, DB errors) must propagate.
+_EVENT_DATA_ERRORS = (KeyError, TypeError, ValueError, AttributeError)
 
 
 @dataclass
 class IngestResult:
     accepted: int = 0
     duplicates: int = 0
+    rejected: int = 0
     gap_detected: bool = False
 
 
@@ -107,8 +126,14 @@ def _project(session: Session, ev: dict[str, Any]) -> None:
         zone_id = ev.get("zone_id")
         if zone_id is None or track_id is None:
             return
+        # Coerce/validate BEFORE touching any ORM state: a rejected event must
+        # not leave a half-mutated open visit behind.
         zone_id, track_id = int(zone_id), int(track_id)
         dwell = ev.get("dwell_sec")
+        if dwell is not None:
+            dwell = float(dwell)
+            if not (0.0 <= dwell <= MAX_DWELL_SEC):
+                raise ValueError(f"dwell_sec out of range [0, {MAX_DWELL_SEC}]: {dwell}")
         classification = ev.get("classification")
         open_visit = session.scalars(
             select(ZoneVisit)
@@ -121,13 +146,14 @@ def _project(session: Session, ev: dict[str, Any]) -> None:
         ).first()
         if open_visit is not None:
             open_visit.exit_ts = ts
-            open_visit.dwell_sec = float(dwell) if dwell is not None else max(
+            open_visit.dwell_sec = dwell if dwell is not None else max(
                 (ts - open_visit.enter_ts).total_seconds(), 0.0)
             open_visit.classification = classification or (
                 "dwell" if (open_visit.dwell_sec or 0) >= 5.0 else "pass_by")
         else:
-            # Lone exit (enter was lost): still record the visit.
-            dwell_f = float(dwell) if dwell is not None else 0.0
+            # Lone exit (enter was lost): still record the visit. dwell is
+            # already validated >= 0, so enter_ts can never land in the future.
+            dwell_f = dwell if dwell is not None else 0.0
             session.add(ZoneVisit(
                 store_id=store_id,
                 zone_id=zone_id,
@@ -160,20 +186,44 @@ def _project(session: Session, ev: dict[str, Any]) -> None:
 
 def _detect_gaps(session: Session, device_id: str, store_id: int,
                  events: list[dict[str, Any]]) -> bool:
-    """Per-device monotonic seq_no check; writes coverage_gap rows for holes."""
-    last_seq = session.scalar(
-        select(func.max(EventRaw.seq_no)).where(EventRaw.device_id == device_id)
-    )
-    prev_time: datetime | None = None
-    if last_seq is not None:
-        prev_time = session.scalar(
-            select(EventRaw.event_time)
-            .where(EventRaw.device_id == device_id, EventRaw.seq_no == last_seq)
-            .limit(1)
-        )
+    """Per-device monotonic seq_no check; writes coverage_gap rows for holes.
+
+    A seq_no BELOW the device's current stream tail means the device counter
+    was reset (edge spool wiped / container recreated): a coverage_gap with
+    reason='seq_reset' is recorded and the baseline moves to the new stream, so
+    genuine holes after the reset keep being detected (previously gap tracking
+    silently died until seq passed the historic max).
+
+    The baseline is the seq_no of the device's LATEST event (by event_time),
+    not the all-time max(seq_no): after a reset the all-time max would flag
+    every following batch as a new reset and lose the rebased tracking."""
+    row = session.execute(
+        select(EventRaw.seq_no, EventRaw.event_time)
+        .where(EventRaw.device_id == device_id)
+        .order_by(EventRaw.event_time.desc(), EventRaw.seq_no.desc())
+        .limit(1)
+    ).first()
+    last_seq: int | None = row[0] if row else None
+    prev_time: datetime | None = row[1] if row else None
     gap_found = False
     for ev in sorted(events, key=lambda e: e["seq_no"]):
         seq = ev["seq_no"]
+        if last_seq is not None and seq < last_seq:
+            # Device counter reset: unknown coverage between the old stream's
+            # tail and this event; rebase gap tracking onto the new stream.
+            session.add(CoverageGap(
+                store_id=store_id,
+                device_id=device_id,
+                gap_start=prev_time or ev["event_time"],
+                gap_end=ev["event_time"],
+                missing_seq_from=None,
+                missing_seq_to=None,
+                reason="seq_reset",
+            ))
+            gap_found = True
+            last_seq = seq
+            prev_time = ev["event_time"]
+            continue
         if last_seq is not None and seq > last_seq + 1:
             session.add(CoverageGap(
                 store_id=store_id,
@@ -201,14 +251,42 @@ def _touch_device(session: Session, device_id: str, store_id: int) -> None:
 
 
 def process_batch(session: Session, tenant_id: str, raw_events: list[dict[str, Any]]) -> IngestResult:
+    """Idempotent batch ingest. Retries on IntegrityError so a concurrent
+    retry of the same batch (edge timeout + re-POST while the first request is
+    still in flight) resolves to duplicates instead of an HTTP 500."""
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            return _process_batch_once(session, tenant_id, raw_events)
+        except IntegrityError:
+            session.rollback()
+            if attempt == attempts - 1:
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _process_batch_once(session: Session, tenant_id: str, raw_events: list[dict[str, Any]]) -> IngestResult:
     result = IngestResult()
     normalized: list[dict[str, Any]] = []
     seen_batch_ids: set[str] = set()
+    tenant_by_store: dict[int, str | None] = {}
+
+    def store_tenant(store_id: int) -> str | None:
+        if store_id not in tenant_by_store:
+            store = session.get(Store, store_id)
+            tenant_by_store[store_id] = store.tenant_id if store is not None else None
+        return tenant_by_store[store_id]
 
     for raw in raw_events:
         ev = normalize_event(raw)
         if ev is None:
-            continue  # malformed: neither accepted nor duplicate
+            result.rejected += 1  # malformed envelope: neither accepted nor duplicate
+            continue
+        if store_tenant(ev["store_id"]) != tenant_id:
+            # Unknown store or another tenant's store: never project data
+            # across the tenant boundary (CONTRACTS section 3 isolation).
+            result.rejected += 1
+            continue
         eid = str(ev["event_id"])
         if eid in seen_batch_ids:
             result.duplicates += 1
@@ -230,20 +308,27 @@ def process_batch(session: Session, tenant_id: str, raw_events: list[dict[str, A
         _touch_device(session, device_id, store_id)
 
     for ev in sorted(normalized, key=lambda e: (str(e["device_id"]), e["seq_no"])):
-        payload = {k: v for k, v in ev.items() if k not in ("event_time",)}
-        payload["event_time"] = ev["event_time"].isoformat() + "Z"
-        session.add(EventRaw(
-            event_id=str(ev["event_id"]),
-            tenant_id=str(ev.get("tenant_id") or tenant_id),
-            store_id=ev["store_id"],
-            device_id=str(ev["device_id"]),
-            seq_no=ev["seq_no"],
-            type=str(ev["type"]),
-            event_time=ev["event_time"],
-            payload_json=payload,
-        ))
-        session.flush()
-        _project(session, ev)
+        try:
+            # _project validates/coerces before any session mutation, so a
+            # data error here leaves no partial state; the event_raw row is
+            # only added once the projection succeeded.
+            _project(session, ev)
+            payload = {k: v for k, v in ev.items() if k not in ("event_time",)}
+            payload["event_time"] = ev["event_time"].isoformat() + "Z"
+            session.add(EventRaw(
+                event_id=str(ev["event_id"]),
+                tenant_id=tenant_id,  # always the authenticated tenant, never the body's
+                store_id=ev["store_id"],
+                device_id=str(ev["device_id"]),
+                seq_no=ev["seq_no"],
+                type=str(ev["type"]),
+                event_time=ev["event_time"],
+                payload_json=payload,
+            ))
+            session.flush()
+        except _EVENT_DATA_ERRORS:
+            result.rejected += 1  # one poisoned event must not drop the batch
+            continue
         result.accepted += 1
 
     session.commit()

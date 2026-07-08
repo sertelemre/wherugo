@@ -1,6 +1,6 @@
 # WherUGo
 
-![Durum: Planlama Aşaması](https://img.shields.io/badge/durum-planlama%20a%C5%9Famas%C4%B1-orange) ![Lisans Hijyeni](https://img.shields.io/badge/lisans-Apache--2.0%20%2F%20MIT%20stack-blue) ![KVKK](https://img.shields.io/badge/tasar%C4%B1m-KVKK--native-green)
+![Durum: MVP Çalışıyor](https://img.shields.io/badge/durum-MVP%20%C3%A7al%C4%B1%C5%9F%C4%B1yor-brightgreen) ![Lisans Hijyeni](https://img.shields.io/badge/lisans-Apache--2.0%20%2F%20MIT%20stack-blue) ![KVKK](https://img.shields.io/badge/tasar%C4%B1m-KVKK--native-green)
 
 **WherUGo, mağazanızın mevcut CCTV kameralarını satış artıran bir davranış analitiği platformuna dönüştürür.** Kenar (edge) cihazda çalışan bilgisayarlı görü, müşteri yolculuğunu anonim metrik olarak ölçer; VLM/LLM katmanı bu metrikleri her sabah Türkçe bir yönetici brifingine çevirir. Video mağazayı asla terk etmez.
 
@@ -61,4 +61,21 @@ flowchart LR
 
 ---
 
-**Proje durumu:** 🟠 **Planlama aşaması** — mimari kararlar kesinleşti, pilot geliştirme başlamadı. Katkı ve geri bildirim için: emres@biscozum.com.tr
+## Hızlı Başlangıç
+
+```bash
+make install   # tek venv'e üç paketi kurar
+make test      # tüm test paketleri (ai + backend + edge)
+make demo      # backend :8000 + hızlandırılmış mağaza simülatörü
+               # → http://localhost:8000 (dashboard, ~1 dk içinde canlı veri)
+make demo-stop # demoyu durdurur
+
+# veya Docker ile:
+docker compose -f deploy/docker-compose.yml up --build
+```
+
+Gerçek kamera sahasında `edge` paketi `--source video` ile (ultralytics/OpenCV, `pip install -e "edge[cv]"`) RTSP akışlarına bağlanır; simülatör ile aynı olay sözleşmesini üretir. AI brifingi varsayılan olarak anahtarsız MockProvider ile çalışır; `WHERUGO_LLM_PROVIDER=openai` + `WHERUGO_LLM_BASE_URL` ile MiMo/vLLM'e, `WHERUGO_LLM_PROVIDER=anthropic` ile Claude'a bağlanır (`CONTRACTS.md` §5).
+
+---
+
+**Proje durumu:** 🟢 **Çalışan MVP** — uçtan uca zincir (simülatör → kenar olay motoru → ingest → analitik → dashboard → AI brifing) testli ve çalışır durumda; saha pilotu için donanım/kurulum yol haritası `docs/07`'de. Katkı ve geri bildirim için: emres@biscozum.com.tr

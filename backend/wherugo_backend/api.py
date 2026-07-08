@@ -8,6 +8,7 @@ from datetime import date as date_type, datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import insights, metrics
@@ -75,7 +76,7 @@ def ingest_events(body: IngestRequest, db: Session = Depends(get_db),
         raise HTTPException(status_code=413, detail=f"batch too large (max {MAX_BATCH_SIZE})")
     result = process_batch(db, auth.tenant_id, body.events)
     return IngestResponse(accepted=result.accepted, duplicates=result.duplicates,
-                          gap_detected=result.gap_detected)
+                          gap_detected=result.gap_detected, rejected=result.rejected)
 
 
 # --- stores -------------------------------------------------------------------
@@ -108,7 +109,11 @@ def store_metrics(store_id: int,
     data = fn(db, store_id, t_from, t_to, granularity)
     badge, detail = quality_context(db, store_id, t_from, t_to,
                                     has_data=data["has_data"] or None)
-    return MetricsResponse(metric=metric, granularity=granularity, series=data["series"],
+    # The metric may override the effective granularity (conversion is always
+    # daily and returns granularity="1d" even when 1h was requested).
+    return MetricsResponse(metric=metric,
+                           granularity=data.get("granularity", granularity),
+                           series=data["series"],
                            total=data["total"], quality_badge=badge, quality_detail=detail)
 
 
@@ -127,6 +132,7 @@ def zone_dwell(store_id: int, zone_id: int,
                                     has_data=data["has_data"] or None)
     return DwellResponse(zone_id=zone_id, zone_name=zone.name, stats=data["stats"],
                          visits=data["visits"], draw_rate=data["draw_rate"],
+                         suppressed=data.get("suppressed", False),
                          quality_badge=badge, quality_detail=detail)
 
 
@@ -217,13 +223,19 @@ def store_funnel(store_id: int,
 
 # --- pos import -----------------------------------------------------------------
 
-@router.post("/stores/{store_id}/pos-import", response_model=PosImportResponse)
+@router.post("/stores/{store_id}/pos-import", response_model=PosImportResponse,
+             response_model_exclude_none=True)
 async def pos_import(store_id: int, file: UploadFile = File(...),
                      db: Session = Depends(get_db), auth: AuthContext = Depends(get_auth)):
     _get_store(db, auth, store_id)
-    content = (await file.read()).decode("utf-8-sig")
+    try:
+        content = (await file.read()).decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=422,
+                            detail="file must be a UTF-8 encoded CSV (dosya UTF-8 kodlamalı CSV olmalı)")
     reader = csv.reader(io.StringIO(content))
     imported = 0
+    skipped = 0
     for row in reader:
         if not row or not row[0].strip():
             continue
@@ -235,8 +247,8 @@ async def pos_import(store_id: int, file: UploadFile = File(...),
             transactions = int(float(row[1]))
             revenue = float(row[2]) if len(row) > 2 and row[2].strip() else 0.0
         except (ValueError, IndexError):
-            raise HTTPException(status_code=422,
-                                detail=f"bad CSV row (expected date,transactions,revenue): {row}")
+            skipped += 1  # bad row: skip and count, do not fail the whole file
+            continue
         existing = db.get(PosDaily, (store_id, day))
         if existing:
             existing.transactions = transactions
@@ -246,7 +258,7 @@ async def pos_import(store_id: int, file: UploadFile = File(...),
                             transactions=transactions, revenue=revenue))
         imported += 1
     db.commit()
-    return PosImportResponse(imported=imported)
+    return PosImportResponse(imported=imported, skipped=skipped or None)
 
 
 # --- ai: briefing / assistant ------------------------------------------------------
@@ -255,20 +267,35 @@ _AI_UNAVAILABLE = ("wherugo_ai package is not installed; briefing/assistant "
                    "endpoints are unavailable (install the ai/ package)")
 
 
+def _briefing_row(db: Session, store_id: int, day) -> Briefing | None:
+    """Canonical stored briefing for (store, day): the FIRST one written, so
+    every reader converges on the same text even if a race ever produced
+    more than one row."""
+    return db.scalars(
+        select(Briefing).where(Briefing.store_id == store_id, Briefing.date == day)
+        .order_by(Briefing.id).limit(1)
+    ).first()
+
+
+def _briefing_response(store_id: int, day, row: Briefing) -> BriefingResponse:
+    return BriefingResponse(store_id=store_id, date=day.isoformat(),
+                            text_md=row.text_md, provider=row.provider,
+                            metric_refs=row.metric_refs_json or [])
+
+
 @router.get("/stores/{store_id}/briefing", response_model=BriefingResponse)
 def store_briefing(store_id: int, date: str | None = Query(None),
                    db: Session = Depends(get_db), auth: AuthContext = Depends(get_auth)):
     store = _get_store(db, auth, store_id)
-    day = parse_date(date) or utcnow().date()
+    try:
+        day = parse_date(date) or utcnow().date()
+    except ValueError:
+        raise HTTPException(status_code=422,
+                            detail="date must be in YYYY-MM-DD format (ISO 8601)")
 
-    existing = db.scalars(
-        select(Briefing).where(Briefing.store_id == store_id, Briefing.date == day)
-        .order_by(Briefing.id.desc()).limit(1)
-    ).first()
+    existing = _briefing_row(db, store_id, day)
     if existing:
-        return BriefingResponse(store_id=store_id, date=day.isoformat(),
-                                text_md=existing.text_md, provider=existing.provider,
-                                metric_refs=existing.metric_refs_json or [])
+        return _briefing_response(store_id, day, existing)
 
     ai = insights.load_ai()
     if ai is None:
@@ -277,13 +304,35 @@ def store_briefing(store_id: int, date: str | None = Query(None),
     t_from = datetime(day.year, day.month, day.day)
     t_to = t_from + timedelta(days=1)
     bundle = insights.build_metrics_bundle(db, store_id, t_from, t_to)
-    result = ai.briefing.generate(bundle, store.name, day.isoformat(), ai.provider)
+    try:
+        result = ai.briefing.generate(bundle, store.name, day.isoformat(), ai.provider)
+    except HTTPException:
+        raise
+    except Exception as exc:  # ProviderError etc. -> 503, not a raw 500
+        raise HTTPException(status_code=503,
+                            detail=f"AI sağlayıcısı yanıt vermedi: {exc}") from exc
     text_md = getattr(result, "text_md", None) or (result.get("text_md") if isinstance(result, dict) else "")
     metric_refs = getattr(result, "metric_refs", None) or (
         result.get("metric_refs") if isinstance(result, dict) else []) or []
+
+    # Get-or-create race: a concurrent request may have stored a briefing for
+    # the same (store, day) while we were generating — prefer that row so both
+    # clients see identical text and no duplicate rows pile up.
+    concurrent = _briefing_row(db, store_id, day)
+    if concurrent is not None:
+        return _briefing_response(store_id, day, concurrent)
     db.add(Briefing(store_id=store_id, date=day, text_md=text_md,
                     provider=ai.provider_name, metric_refs_json=list(metric_refs)))
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A (store_id, date) unique constraint (e.g. in a PG deployment) fired:
+        # someone else won the insert; serve their row.
+        db.rollback()
+        winner = _briefing_row(db, store_id, day)
+        if winner is not None:
+            return _briefing_response(store_id, day, winner)
+        raise
     return BriefingResponse(store_id=store_id, date=day.isoformat(), text_md=text_md,
                             provider=ai.provider_name, metric_refs=list(metric_refs))
 
@@ -298,7 +347,13 @@ def store_assistant(store_id: int, body: AssistantRequest,
     t_to = utcnow()
     t_from = t_to - timedelta(hours=24)
     bundle = insights.build_metrics_bundle(db, store_id, t_from, t_to)
-    result = ai.assistant.answer(body.question, bundle, ai.provider)
+    try:
+        result = ai.assistant.answer(body.question, bundle, ai.provider)
+    except HTTPException:
+        raise
+    except Exception as exc:  # ProviderError etc. -> 503, not a raw 500
+        raise HTTPException(status_code=503,
+                            detail=f"AI sağlayıcısı yanıt vermedi: {exc}") from exc
     answer_md = getattr(result, "answer_md", None) or (
         result.get("answer_md") if isinstance(result, dict) else "")
     metrics_used = getattr(result, "metrics_used", None) or (
