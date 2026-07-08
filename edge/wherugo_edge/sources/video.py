@@ -96,10 +96,15 @@ class MockDetector:
         min_area_px: float = 120.0,
         history: int = 120,
         var_threshold: float = 16.0,
+        warmup_frames: int = 5,
+        max_area_ratio: float = 0.5,
     ) -> None:
         cv2 = _require_cv2()
         self._cv2 = cv2
         self.min_area_px = float(min_area_px)
+        self.warmup_frames = int(warmup_frames)
+        self.max_area_ratio = float(max_area_ratio)
+        self._seen = 0
         self._subtractor = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=var_threshold, detectShadows=False
         )
@@ -108,16 +113,22 @@ class MockDetector:
     def detect(self, frame: Any) -> list[Detection]:
         cv2 = self._cv2
         mask = self._subtractor.apply(frame)
+        self._seen += 1
+        if self._seen <= self.warmup_frames:
+            return []  # model henüz ısınmadı: ilk kareler tümüyle "ön plan" görünür
         _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
         # delikleri kapat + yakın parçaları birleştir (tek kişi = tek blob)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._kernel)
         mask = cv2.dilate(mask, self._kernel, iterations=1)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        frame_area = float(mask.shape[0] * mask.shape[1])
         dets: list[Detection] = []
         for c in contours:
             if cv2.contourArea(c) < self.min_area_px:
                 continue
             x, y, w, h = cv2.boundingRect(c)
+            if w * h > self.max_area_ratio * frame_area:
+                continue  # tam-kare blob: aydınlatma değişimi / model sıfırlanması
             dets.append(Detection(float(x), float(y), float(x + w), float(y + h), conf=0.6))
         return dets
 

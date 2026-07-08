@@ -13,7 +13,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cv = ["ultralytics", "opencv-python"]
+# CONTRACTS §16: [cv] GPU'suz video yolu (mock dedektör; torch DEĞİL),
+# [yolo] saha yolu (ultralytics torch indirir), CONTRACTS §13: [mqtt] üretim taşıması.
+cv = ["opencv-python-headless>=4.8"]
+yolo = ["ultralytics", "opencv-python-headless>=4.8"]
+mqtt = ["paho-mqtt>=1.6"]
 test = ["pytest>=7.0"]
 
 [project.scripts]

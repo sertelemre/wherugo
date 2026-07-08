@@ -42,6 +42,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--spool", default=None, help="SQLite spool yolu (vars: config publisher.spool_path)")
     ap.add_argument("--video-source", default=None, help="--source video için RTSP URL / dosya yolu")
     ap.add_argument(
+        "--detector",
+        choices=["yolo", "mock"],
+        default=None,
+        help="--source video dedektörü: yolo (ultralytics) | mock (GPU'suz, saf OpenCV); vars: config video.detector",
+    )
+    ap.add_argument(
         "--backend-url",
         default=None,
         help="config'teki backend_url'i geçersiz kıl (vars: env WHERUGO_BACKEND_URL, sonra config)",
@@ -72,14 +78,15 @@ def _install_sigterm_handler() -> None:
 
 
 def _run_video(cfg, args) -> int:
-    from .sources.video import open_source  # [cv] yoksa anlaşılır ImportError
+    from .sources.video import open_source  # bağımlılık yoksa anlaşılır ImportError
 
     if not args.video_source:
         print("hata: --source video için --video-source (RTSP URL / dosya) gerekli", file=sys.stderr)
         return 2
+    from .clips import ClipRecorder, resolve_vlm_judge
     from .zones import ZoneEngine
 
-    src = open_source(cfg, args.video_source)
+    src = open_source(cfg, args.video_source, detector=args.detector)
     ep = cfg.engine
     engine = ZoneEngine(
         cfg.zones,
@@ -89,12 +96,16 @@ def _run_video(cfg, args) -> int:
         queue_interval_sec=ep.queue_interval_sec,
         service_time_sec=ep.service_time_sec,
     )
+    # Klip yolu (CONTRACTS §15) YALNIZ video modunda kurulur; simulate yolu
+    # bu fonksiyona hiç girmez, klip/piksel kodu orada çalışmaz.
+    recorder = ClipRecorder(cfg.video.clip_dir, ttl_hours=cfg.video.clip_ttl_hours)
+    vlm_judge = resolve_vlm_judge()  # WHERUGO_VLM_BASE_URL boşsa None
     publisher = None if args.dry_run else Publisher(cfg, spool_path=args.spool)
     enveloper = Enveloper(cfg.tenant_id, cfg.store_id, cfg.device_id) if args.dry_run else None
 
     started = time.monotonic()
     try:
-        _video_loop(src, engine, publisher, enveloper, args, started)
+        _video_loop(src, engine, publisher, enveloper, args, started, recorder, vlm_judge)
     except KeyboardInterrupt:
         pass  # SIGINT/SIGTERM: temiz kapanış (finally flush+close yapar)
     finally:
@@ -104,9 +115,11 @@ def _run_video(cfg, args) -> int:
     return 0
 
 
-def _video_loop(src, engine, publisher, enveloper, args, started: float) -> None:
-    from .events import Quality, TrackUpdate
+def _video_loop(src, engine, publisher, enveloper, args, started: float, recorder=None, vlm_judge=None) -> None:
+    from .clips import judge_interaction
+    from .events import InteractionDetected, Quality, TrackUpdate
 
+    env = publisher.enveloper if publisher is not None else enveloper
     for sample in src.samples():
         events = [
             TrackUpdate(
@@ -123,6 +136,14 @@ def _video_loop(src, engine, publisher, enveloper, args, started: float) -> None
         events.extend(engine.process(sample))
         events.extend(engine.tick(sample.ts))
         for ev in events:
+            if recorder is not None and isinstance(ev, InteractionDetected):
+                # env.next_seq: bu olayın zarfta alacağı seq (sıralı publish).
+                clip_path = recorder.save_clip(
+                    src.recent_frames(ev.event_time), seq=env.next_seq, when=ev.event_time
+                )
+                if clip_path is not None:
+                    ev.clip_ref = str(clip_path.relative_to(recorder.dir))
+                    judge_interaction(vlm_judge, ev, clip_path)
             if publisher is not None:
                 publisher.publish(ev)
             else:
@@ -131,6 +152,8 @@ def _video_loop(src, engine, publisher, enveloper, args, started: float) -> None
                 print(json.dumps(wire, ensure_ascii=False))
         if publisher is not None:
             publisher.flush()
+        if recorder is not None:
+            recorder.maybe_cleanup()  # saatlik TTL temizliği (duvar saati)
         if args.duration and time.monotonic() - started >= args.duration:
             break
 

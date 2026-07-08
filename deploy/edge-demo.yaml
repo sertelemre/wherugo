@@ -85,3 +85,25 @@ publisher:
   spool_path: "wherugo-edge-spool.sqlite"
   batch_size: 200
   flush_interval_sec: 2.0
+  # --- MQTT taşıma (CONTRACTS §13, üretim yolu) ---------------------------
+  # Varsayılan transport http'dir (yukarıdaki davranış). MQTT için paho-mqtt
+  # gerekir: pip install 'wherugo-edge[mqtt]'. Spool/at-least-once davranışı
+  # taşımadan bağımsız aynıdır; topic: t/{tenant_id}/{store_id}/{device_id}/events
+  # transport: mqtt
+  # mqtt:
+  #   host: localhost
+  #   port: 1883
+  #   qos: 1
+
+# --- Video kaynağı (CONTRACTS §15/§16; yalnız --source video) -------------
+# GPU'suz test/CI: detector mock (opencv-python-headless, [cv] extra).
+# Saha: detector yolo (pip install 'wherugo-edge[yolo]', torch indirir).
+# Interaction anında son ~10 sn'nin 8 jpeg karesi clip_dir altına YALNIZ
+# yerel yazılır (clips/<YYYY-MM-DD>/evt-<seq>/frame-N.jpg, 72 saat TTL);
+# WHERUGO_VLM_BASE_URL doluysa VLM verdict'i olaya eklenir (piksel tel'e çıkmaz).
+# video:
+#   detector: mock          # yolo | mock (vars: yolo)
+#   clip_dir: ./clips       # interaction klipleri (yalnız yerel disk)
+#   clip_ttl_hours: 72
+#   sample_hz: 1.0          # track başına örnekleme frekansı
+#   model: yolo11n.pt       # yalnız detector: yolo için
