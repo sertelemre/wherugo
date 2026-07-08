@@ -12,6 +12,7 @@ Provider selection via environment (see :func:`get_provider`):
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 from typing import Any, Protocol, runtime_checkable
@@ -49,6 +50,13 @@ def _post_json(url: str, body: dict, headers: dict, timeout: float) -> dict:
         raise ProviderError(f"HTTP {exc.code} from {url}: {detail or exc.reason}") from exc
     except URLError as exc:
         raise ProviderError(f"cannot reach {url}: {exc.reason}") from exc
+    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+        # Gövde okuma sırasındaki timeout / kesik yanıt (IncompleteRead) /
+        # bağlantı kopması da ProviderError olarak sarılır; ham TimeoutError
+        # veya HTTPException çağırana sızmaz. (TimeoutError, OSError'ın alt
+        # sınıfı olsa da açıkça listelenir; HTTPError/URLError yukarıda ele
+        # alındığı için buraya düşmez.)
+        raise ProviderError(f"network error while reading response from {url}: {exc!r}") from exc
     try:
         return json.loads(raw)
     except json.JSONDecodeError as exc:

@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 from urllib.error import HTTPError, URLError
@@ -141,6 +142,56 @@ def test_openai_compat_network_error_wrapped(monkeypatch):
     monkeypatch.setattr(providers, "urlopen", fake_urlopen)
     p = OpenAICompatProvider(base_url="http://x", model="m")
     with pytest.raises(ProviderError, match="cannot reach"):
+        p.complete("s", "u")
+
+
+class FailingReadResponse:
+    """Bağlantı kuruldu ama gövde okunurken hata çıktı senaryosu (C22)."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def read(self):
+        raise self._exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _urlopen_failing_read(monkeypatch, exc):
+    monkeypatch.setattr(
+        providers, "urlopen", lambda req, timeout=None: FailingReadResponse(exc)
+    )
+
+
+def test_openai_compat_timeout_during_read_wrapped(monkeypatch):
+    _urlopen_failing_read(monkeypatch, TimeoutError("timed out"))
+    p = OpenAICompatProvider(base_url="http://x", model="m")
+    with pytest.raises(ProviderError, match="network error while reading"):
+        p.complete("s", "u")
+
+
+def test_openai_compat_incomplete_read_wrapped(monkeypatch):
+    _urlopen_failing_read(monkeypatch, http.client.IncompleteRead(b"kismi"))
+    p = OpenAICompatProvider(base_url="http://x", model="m")
+    with pytest.raises(ProviderError, match="network error while reading"):
+        p.complete("s", "u")
+
+
+def test_anthropic_timeout_during_read_wrapped(monkeypatch):
+    _urlopen_failing_read(monkeypatch, TimeoutError("timed out"))
+    p = AnthropicProvider(api_key="k")
+    with pytest.raises(ProviderError, match="network error while reading"):
+        p.complete("s", "u")
+
+
+def test_anthropic_connection_reset_during_read_wrapped(monkeypatch):
+    _urlopen_failing_read(monkeypatch, ConnectionResetError("reset"))
+    p = AnthropicProvider(api_key="k")
+    with pytest.raises(ProviderError, match="network error while reading"):
         p.complete("s", "u")
 
 

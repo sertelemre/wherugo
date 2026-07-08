@@ -35,6 +35,20 @@ const ZONE_TYPE_TR = {
   checkout: 'Kasa', fitting_room: 'Deneme kabini', other: 'Diğer',
 };
 
+// Görünüm nesli (C11): sekme, tarih aralığı veya harita türü değişince artar.
+// Her async doldurucu başlangıçta nesli yakalar ve await sonrasında nesil
+// eskimişse DOM'a YAZMADAN döner — geciken eski yanıt yeni görünümü ezemez.
+let renderEpoch = 0;
+
+function bumpEpoch() {
+  renderEpoch += 1;
+  return renderEpoch;
+}
+
+function isStale(epoch) {
+  return epoch !== renderEpoch;
+}
+
 // ---------------------------------------------------------------------------
 // Yardımcılar
 // ---------------------------------------------------------------------------
@@ -78,6 +92,32 @@ function showError(el, err) {
     '<br><button type="button" class="btn btn--sm" data-retry>Yeniden dene</button></div>';
 }
 
+/**
+ * CONTRACTS §4 quality_detail yapılandırılmış bir NESNEDİR
+ * ({window_sec, coverage_gap_sec, coverage_gap_pct, gap_count, has_data, reason}).
+ * Tooltip'te '[object Object]' yerine okunur Türkçe özet üretir (m8).
+ */
+function qualityDetailText(detail) {
+  if (detail == null) return '';
+  if (typeof detail === 'string') return detail;
+  if (typeof detail !== 'object') return String(detail);
+  const parts = [];
+  const gapSec = Number(detail.coverage_gap_sec);
+  const gapPct = Number(detail.coverage_gap_pct);
+  if (Number.isFinite(gapSec) && gapSec > 0) {
+    parts.push(`kapsam boşluğu: ${fmtDur(gapSec)}` +
+      (Number.isFinite(gapPct) ? ` (%${fmtNum1(gapPct)})` : ''));
+  } else if (Number.isFinite(gapPct) && gapPct > 0) {
+    parts.push(`kapsam boşluğu: %${fmtNum1(gapPct)}`);
+  } else if (Number.isFinite(gapSec) || Number.isFinite(gapPct)) {
+    parts.push('kapsam boşluğu yok');
+  }
+  const gapCount = Number(detail.gap_count);
+  if (Number.isFinite(gapCount) && gapCount > 0) parts.push(`${fmtInt(gapCount)} boşluk kaydı`);
+  if (typeof detail.has_data === 'boolean') parts.push(`veri: ${detail.has_data ? 'var' : 'yok'}`);
+  return parts.join(' · ');
+}
+
 function qualityBadgeHtml(badge, detail, { small = false } = {}) {
   const b = ['green', 'yellow', 'red'].includes(badge) ? badge : null;
   if (!b) return '';
@@ -87,7 +127,7 @@ function qualityBadgeHtml(badge, detail, { small = false } = {}) {
     yellow: 'Kapsam boşluğu penceresi %2’yi aştı; düzeltme uygulandı.',
     red: 'Veri eksik ya da kapsam boşluğu %10’u aştı.',
   }[b];
-  const tip = detail || fallbackDetail;
+  const tip = qualityDetailText(detail) || fallbackDetail;
   return `<span class="q-badge q-badge--${b}${small ? ' q-badge--sm' : ''}" tabindex="0" ` +
     `title="${escapeHtml(tip)}"><span class="q-dot" aria-hidden="true"></span>` +
     `${small ? '' : 'Veri kalitesi: '}${label}</span>`;
@@ -332,6 +372,7 @@ function setTab(tab) {
 }
 
 function renderCurrent() {
+  bumpEpoch(); // uçuştaki eski yanıtlar artık DOM'a yazamaz (C11)
   stopQueuePolling();
   hideTip();
   const root = $('#view');
@@ -374,6 +415,7 @@ function setKpiError(id, err) {
 // ---------------------------------------------------------------------------
 
 async function viewOverview(root) {
+  const epoch = renderEpoch;
   root.innerHTML = `
     <div class="kpi-row">
       ${kpiTile('kpi-ff', 'Ziyaretçi (footfall)')}
@@ -398,6 +440,7 @@ async function viewOverview(root) {
     fetchMetric('occupancy', '1h', r),
     fetchMetric('conversion', '1d', r),
   ]);
+  if (isStale(epoch)) return; // görünüm değişti — eski yanıtı çizme (C11)
 
   // Footfall kartı + grafik
   if (ff.status === 'fulfilled') {
@@ -485,6 +528,7 @@ async function viewHeatmap(root) {
     btn.addEventListener('click', () => {
       if (state.heatKind === btn.dataset.kind) return;
       state.heatKind = btn.dataset.kind;
+      bumpEpoch(); // eski tür için uçuştaki yanıt çizilmesin (C11)
       $$('.seg-btn[data-kind]', root).forEach((b) => b.classList.toggle('is-active', b === btn));
       fillHeatmap();
     });
@@ -494,6 +538,8 @@ async function viewHeatmap(root) {
 }
 
 async function fillHeatmap() {
+  const epoch = renderEpoch;
+  const kind = state.heatKind; // yanıt bu türe ait — çizim etiketi de öyle olmalı
   const wrap = $('#heat-wrap');
   const meta = $('#heat-meta');
   if (!wrap) return;
@@ -501,11 +547,13 @@ async function fillHeatmap() {
     const store = await ensureStore();
     const r = currentRange();
     const d = await apiGet(`/v1/stores/${state.storeId}/heatmap` + qs({
-      from: r.fromIso, to: r.toIso, cell_m: CELL_M, kind: state.heatKind,
+      from: r.fromIso, to: r.toIso, cell_m: CELL_M, kind,
     }));
+    if (isStale(epoch)) return; // tür/aralık/sekme değişti (C11)
     const cells = normalizeHeatCells(Array.isArray(d?.cells) ? d.cells : [], store);
-    drawHeatmap(wrap, meta, store, cells, Number(d?.k_suppressed) || 0);
+    drawHeatmap(wrap, meta, store, cells, Number(d?.k_suppressed) || 0, kind);
   } catch (err) {
+    if (isStale(epoch)) return;
     showError(wrap, err);
     if (meta) meta.innerHTML = '';
   }
@@ -532,7 +580,7 @@ function normalizeHeatCells(cellsRaw, store) {
     .filter((c) => c.mx >= 0 && c.my >= 0 && c.mx < store.planW && c.my < store.planH);
 }
 
-function drawHeatmap(wrap, meta, store, cells, kSuppressed) {
+function drawHeatmap(wrap, meta, store, cells, kSuppressed, kind = state.heatKind) {
   wrap.innerHTML = '';
   const canvas = document.createElement('canvas');
   canvas.className = 'heat-canvas';
@@ -611,8 +659,8 @@ function drawHeatmap(wrap, meta, store, cells, kSuppressed) {
   ctx.lineWidth = 1;
   ctx.strokeRect(0.5, 0.5, cssW - 1, cssH - 1);
 
-  // Hücre üstünde araç ipucu
-  const unit = state.heatKind === 'density' ? 'geçiş' : 'sn dwell';
+  // Hücre üstünde araç ipucu — birim, verinin alındığı türe göre (C11)
+  const unit = kind === 'density' ? 'geçiş' : 'sn dwell';
   canvas.addEventListener('mousemove', (e) => {
     const rect = canvas.getBoundingClientRect();
     const mx = (e.clientX - rect.left) / scale;
@@ -629,7 +677,7 @@ function drawHeatmap(wrap, meta, store, cells, kSuppressed) {
   canvas.addEventListener('mouseleave', hideTip);
 
   // Gösterge + KVKK notu
-  const kindNote = state.heatKind === 'density'
+  const kindNote = kind === 'density'
     ? 'Yoğunluk: hücreden geçen konum örneği sayısı.'
     : 'Dwell: hücrede duraklamayla geçirilen toplam süre (sn).';
   const kNote = kSuppressed > 0
@@ -676,10 +724,12 @@ async function viewZones(root) {
 }
 
 async function fillZoneDwell(r) {
+  const epoch = renderEpoch;
   const chartEl = $('#z-dwell');
   const tableEl = $('#z-table');
   try {
     const store = await ensureStore();
+    if (isStale(epoch)) return; // görünüm değişti (C11)
     if (!store.zones.length) {
       showState(chartEl, 'Bu mağazada bölge tanımı yok.');
       showState(tableEl, 'Bu mağazada bölge tanımı yok.');
@@ -689,6 +739,7 @@ async function fillZoneDwell(r) {
       apiGet(`/v1/stores/${state.storeId}/zones/${z.id}/dwell` + qs({
         stat: 'p50,p95', from: r.fromIso, to: r.toIso,
       }))));
+    if (isStale(epoch)) return; // aralık/sekme değişti — eski yanıtları çizme (C11)
     const rows = store.zones.map((z, i) => (results[i].status === 'fulfilled'
       ? { zone: z, ...normalizeDwell(results[i].value) }
       : { zone: z, error: results[i].reason }));
@@ -729,18 +780,21 @@ async function fillZoneDwell(r) {
       numFrom: 2,
     });
   } catch (err) {
+    if (isStale(epoch)) return;
     showError(chartEl, err);
     showError(tableEl, err);
   }
 }
 
 async function fillFirstDestination(r) {
+  const epoch = renderEpoch;
   const el = $('#z-first');
   try {
     await ensureStore(); // zone_id → ad çevirisi için
     const d = await apiGet(`/v1/stores/${state.storeId}/paths/first-destination` + qs({
       from: r.fromIso, to: r.toIso,
     }));
+    if (isStale(epoch)) return; // görünüm değişti (C11)
     const items = (normalizeDistribution(d) ?? []).filter((it) => it.value > 0);
     if (!items.length) {
       showState(el, 'Bu aralıkta ilk-varış verisi yok.');
@@ -775,17 +829,20 @@ async function fillFirstDestination(r) {
     const kSup = Number(d?.k_suppressed) || 0;
     $('#z-first-note').textContent = kSup > 0 ? `${fmtInt(kSup)} kayıt k<10 bastırıldı` : '';
   } catch (err) {
+    if (isStale(epoch)) return;
     showError(el, err);
   }
 }
 
 async function fillTransitions(r) {
+  const epoch = renderEpoch;
   const el = $('#z-trans');
   try {
     await ensureStore();
     const d = await apiGet(`/v1/stores/${state.storeId}/paths/transitions` + qs({
       from: r.fromIso, to: r.toIso,
     }));
+    if (isStale(epoch)) return; // görünüm değişti (C11)
     const t = normalizeTransitions(d);
     if (!t || !t.labels.length) {
       showState(el, 'Bu aralıkta geçiş verisi yok.');
@@ -793,6 +850,7 @@ async function fillTransitions(r) {
     }
     el.innerHTML = transitionsMatrixHtml(t.labels, t.matrix);
   } catch (err) {
+    if (isStale(epoch)) return;
     showError(el, err);
   }
 }
@@ -819,11 +877,14 @@ function transitionsMatrixHtml(labels, matrix) {
 // ---------------------------------------------------------------------------
 
 let queueTimer = null;
+let queueInFlight = 0; // m5: uçuşta istek varken yeni poll tick'i başlatılmaz
 
 function startQueuePolling() {
   stopQueuePolling();
   queueTimer = setInterval(() => {
-    if (state.tab === 'queue') fillQueue(false);
+    // Önceki istek hâlâ uçuştaysa bu tick atlanır: istekler üst üste binemez
+    // ve yavaş yanıt, sonraki tick'in taze verisini ezemez (m5).
+    if (state.tab === 'queue' && queueInFlight === 0) fillQueue(false);
   }, QUEUE_POLL_MS);
 }
 
@@ -838,6 +899,7 @@ function pickQueueZone(store) {
 }
 
 async function viewQueue(root) {
+  const epoch = renderEpoch;
   root.innerHTML = `
     <div id="q-alert" aria-live="polite"></div>
     <div class="kpi-row">
@@ -854,14 +916,18 @@ async function viewQueue(root) {
     </section>`;
 
   await fillQueue(true);
+  if (isStale(epoch)) return; // kullanıcı bu arada sekme değiştirdi (C11)
   startQueuePolling();
 }
 
 async function fillQueue(first) {
+  const epoch = renderEpoch;
   const chartEl = $('#q-chart');
   if (!chartEl) return;
+  queueInFlight += 1;
   try {
     const store = await ensureStore();
+    if (isStale(epoch)) return; // görünüm değişti (C11)
     const qz = pickQueueZone(store);
     if (!qz) {
       showState(chartEl, 'Bu mağazada kuyruk tipi bölge tanımlı değil.');
@@ -871,6 +937,8 @@ async function fillQueue(first) {
       return;
     }
     const d = await apiGet(`/v1/stores/${state.storeId}/queues/${qz.id}/live`);
+    // Geciken yanıt sıra bozamaz: görünüm bu arada yenilendiyse yazma (m5 + C11).
+    if (isStale(epoch)) return;
     const q = normalizeQueueLive(d);
 
     setKpi('kpi-qlen',
@@ -890,6 +958,7 @@ async function fillQueue(first) {
     fillQueueChart(chartEl, q);
     $('#q-upd').textContent = `güncellendi ${fmtClock(new Date())} · 15 sn'de bir yenilenir`;
   } catch (err) {
+    if (isStale(epoch)) return;
     if (first) {
       showError(chartEl, err);
       setKpiError('kpi-qlen', err);
@@ -900,6 +969,8 @@ async function fillQueue(first) {
       const upd = $('#q-upd');
       if (upd) upd.textContent = 'güncelleme başarısız — 15 sn sonra yeniden denenecek';
     }
+  } finally {
+    queueInFlight -= 1;
   }
 }
 
@@ -985,11 +1056,13 @@ async function viewBriefing(root) {
 }
 
 async function fillBriefing() {
+  const epoch = renderEpoch;
   const body = $('#b-body');
   const metaEl = $('#b-meta');
   try {
     const date = briefingDate();
     const d = await apiGet(`/v1/stores/${state.storeId}/briefing` + qs({ date }));
+    if (isStale(epoch)) return; // görünüm değişti (C11)
     const md = d?.text_md ?? d?.markdown ?? d?.text ?? (typeof d === 'string' ? d : '');
     if (!md) {
       showState(body, 'Bu tarih için brifing bulunamadı.');
@@ -998,6 +1071,7 @@ async function fillBriefing() {
     body.innerHTML = mdToHtml(md);
     metaEl.textContent = `${d?.date ?? date}${d?.provider ? ' · ' + d.provider : ''}`;
   } catch (err) {
+    if (isStale(epoch)) return;
     showError(body, err);
   }
 }
