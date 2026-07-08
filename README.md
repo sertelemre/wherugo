@@ -38,7 +38,11 @@ flowchart LR
 - Tam mağaza funnel'ı ve path/first-destination analizi (Faz 2)
 - Planogram A/B testi (diff-in-diff) ve agregat çalışan-müşteri etkileşim metrikleri
 - **Veri kalite rozeti** (yeşil/sarı/kırmızı) ve kalibrasyonlu güven aralıkları
-- AI günlük brifing: teşhis + aksiyon önerisi + kaynak metrik referansı
+- AI günlük brifing (otomatik zamanlayıcılı): teşhis + aksiyon önerisi + kaynak metrik referansı
+- **Yönetim arayüzü:** interaktif bölge editörü, mağaza ayarları, cihaz filosu görünümü
+- **Kuyruk alarm webhook'ları** + alarm geçmişi; saatlik zone rollup **CSV export** (k-anonimlikli)
+- JWT kimlik doğrulama (API anahtarı → token) ve çok kiracılı izolasyon
+- Üretim yolu: **MQTT taşıma** (mosquitto + köprü, compose `--profile mqtt`) ve PostgreSQL (`--profile postgres`)
 
 > ### 🔒 Gizlilik Taahhüdümüz
 > - **Yüz tanıma, duygu ve demografi analizi yoktur** — ürün politikasıyla kapsam dışıdır (KVKK Kurul kararı 2022/797, EU AI Act Art. 5 uyumlu).
@@ -72,6 +76,9 @@ make demo-stop # demoyu durdurur
 
 # veya Docker ile:
 docker compose -f deploy/docker-compose.yml up --build
+# üretim-benzeri: MQTT taşıma + PostgreSQL
+WHERUGO_DB_URL='postgresql+psycopg://wherugo:wherugo@postgres:5432/wherugo' \
+docker compose -f deploy/docker-compose.yml --profile mqtt --profile postgres up --build
 ```
 
 Gerçek kamera sahasında `edge` paketi `--source video` ile (ultralytics/OpenCV, `pip install -e "edge[cv]"`) RTSP akışlarına bağlanır; simülatör ile aynı olay sözleşmesini üretir. AI brifingi varsayılan olarak anahtarsız MockProvider ile çalışır; `WHERUGO_LLM_PROVIDER=openai` + `WHERUGO_LLM_BASE_URL` ile MiMo/vLLM'e, `WHERUGO_LLM_PROVIDER=anthropic` ile Claude'a bağlanır (`CONTRACTS.md` §5).
